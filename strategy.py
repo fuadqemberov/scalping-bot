@@ -10,16 +10,16 @@ Indicators
             optionally reset at each UTC day (intraday session VWAP).
 
 Signals (evaluated on the most recent row of the frame passed in, which the
-bot guarantees is a *closed* candle):
-    LONG  : close > VWAP, EMA_fast > EMA_slow, RSI was < RSI_OVERSOLD within
-            the previous RSI_LOOKBACK bars and is now above it and rising.
-    SHORT : close < VWAP, EMA_fast < EMA_slow, RSI was > RSI_OVERBOUGHT within
-            the previous RSI_LOOKBACK bars and is now below it and falling.
+bot guarantees is a *closed* candle) - "buy the pullback in an uptrend":
+    LONG  : close > VWAP, EMA_fast > EMA_slow, RSI was < RSI_PULLBACK_LONG
+            within the previous RSI_LOOKBACK bars and is now above it and rising.
+    SHORT : close < VWAP, EMA_fast < EMA_slow, RSI was > RSI_PULLBACK_SHORT
+            within the previous RSI_LOOKBACK bars and is now below it and falling.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -148,42 +148,74 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
-def generate_signal(df: pd.DataFrame) -> Optional[str]:
-    """Return "LONG", "SHORT" or None based on the last row of an indicator frame."""
+def evaluate_signal(df: pd.DataFrame) -> Dict[str, Any]:
+    """Evaluate the entry rules on the last row and explain the outcome.
+
+    Returns a dict with ``signal`` ("LONG", "SHORT" or None), ``trend``
+    ("UP", "DOWN" or "MIXED"), the RSI values involved and a short
+    human-readable ``reason`` (useful for logging why nothing fired).
+    """
     lookback = config.RSI_LOOKBACK
+    lo, hi = config.RSI_PULLBACK_LONG, config.RSI_PULLBACK_SHORT
+    result: Dict[str, Any] = {"signal": None, "trend": None, "rsi": None,
+                              "rsi_min": None, "rsi_max": None, "reason": ""}
     if df is None or len(df) < lookback + 2:
-        return None
+        result["reason"] = "not enough bars"
+        return result
     needed = ["close", "VWAP", "EMA_FAST", "EMA_SLOW", "RSI"]
     if any(c not in df.columns for c in needed):
-        return None
+        result["reason"] = "indicators missing"
+        return result
 
     tail = df.iloc[-(lookback + 1):]
     if tail[needed].isna().any().any():
-        return None  # indicators not warmed up yet
+        result["reason"] = "indicators warming up"
+        return result
 
     last = tail.iloc[-1]
     rsi_now = float(last["RSI"])
     rsi_prev = float(tail["RSI"].iloc[-2])
     rsi_window = tail["RSI"].iloc[:-1]  # previous `lookback` bars
+    rsi_min, rsi_max = float(rsi_window.min()), float(rsi_window.max())
+    result.update(rsi=rsi_now, rsi_min=rsi_min, rsi_max=rsi_max)
 
-    long_trend = last["close"] > last["VWAP"] and last["EMA_FAST"] > last["EMA_SLOW"]
-    long_momentum = (
-        (rsi_window < config.RSI_OVERSOLD).any()
-        and rsi_now > config.RSI_OVERSOLD
-        and rsi_now > rsi_prev
-    )
-    if long_trend and long_momentum:
-        return "LONG"
+    above_vwap = last["close"] > last["VWAP"]
+    below_vwap = last["close"] < last["VWAP"]
+    ema_up = last["EMA_FAST"] > last["EMA_SLOW"]
+    ema_down = last["EMA_FAST"] < last["EMA_SLOW"]
 
-    short_trend = last["close"] < last["VWAP"] and last["EMA_FAST"] < last["EMA_SLOW"]
-    short_momentum = (
-        (rsi_window > config.RSI_OVERBOUGHT).any()
-        and rsi_now < config.RSI_OVERBOUGHT
-        and rsi_now < rsi_prev
-    )
-    if short_trend and short_momentum:
-        return "SHORT"
-    return None
+    if above_vwap and ema_up:
+        result["trend"] = "UP"
+        dipped = rsi_min < lo
+        if dipped and rsi_now > lo and rsi_now > rsi_prev:
+            result["signal"] = "LONG"
+            result["reason"] = f"uptrend pullback: RSI {rsi_min:.1f} -> {rsi_now:.1f} crossed {lo}"
+        elif not dipped:
+            result["reason"] = f"uptrend, waiting for pullback (RSI min {rsi_min:.1f} >= {lo})"
+        else:
+            result["reason"] = f"uptrend, RSI {rsi_now:.1f} still below {lo} or not rising yet"
+    elif below_vwap and ema_down:
+        result["trend"] = "DOWN"
+        spiked = rsi_max > hi
+        if spiked and rsi_now < hi and rsi_now < rsi_prev:
+            result["signal"] = "SHORT"
+            result["reason"] = f"downtrend pullback: RSI {rsi_max:.1f} -> {rsi_now:.1f} crossed {hi}"
+        elif not spiked:
+            result["reason"] = f"downtrend, waiting for pullback (RSI max {rsi_max:.1f} <= {hi})"
+        else:
+            result["reason"] = f"downtrend, RSI {rsi_now:.1f} still above {hi} or not falling yet"
+    else:
+        result["trend"] = "MIXED"
+        result["reason"] = (
+            f"no clear trend (close {'>' if above_vwap else '<'} VWAP, "
+            f"EMA{config.EMA_FAST} {'>' if ema_up else '<'} EMA{config.EMA_SLOW})"
+        )
+    return result
+
+
+def generate_signal(df: pd.DataFrame) -> Optional[str]:
+    """Return "LONG", "SHORT" or None based on the last row of an indicator frame."""
+    return evaluate_signal(df)["signal"]
 
 
 def calculate_sl_tp(

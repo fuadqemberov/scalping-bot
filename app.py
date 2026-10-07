@@ -51,10 +51,10 @@ if not worker.is_alive():  # thread died unexpectedly (should not happen) -> res
 
 snap = worker.state.snapshot()
 stats = snap.get("stats") or worker.engine.get_stats()
-position = snap.get("position")
+positions: dict = snap.get("positions") or {}
 trades = snap.get("trade_history") or []
-candles: pd.DataFrame | None = snap.get("candles")
-last_price = snap.get("last_price")
+symbols: list = snap.get("symbols") or [snap.get("symbol")]
+markets: dict = snap.get("markets") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +115,16 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📊 Market")
+    # Symbol shown on the chart; the bot itself trades all of them.
+    default_sym = st.session_state.get("chart_symbol")
+    if default_sym not in symbols:
+        default_sym = next((s for s in symbols if s in positions), symbols[0])
+    selected = st.selectbox("Chart symbol", symbols, index=symbols.index(default_sym), key="chart_symbol")
     st.markdown(
-        f"**Symbol:** `{snap.get('symbol')}`  \n"
+        f"**Scanning:** `{', '.join(symbols)}`  \n"
         f"**Exchange:** `{snap.get('exchange')}`  \n"
-        f"**Timeframe:** `{snap.get('timeframe')}`"
+        f"**Timeframe:** `{snap.get('timeframe')}`  \n"
+        f"**Open positions:** {len(positions)} / {config.MAX_OPEN_POSITIONS}"
     )
 
     st.subheader("⚙️ Risk Parameters")
@@ -135,10 +141,16 @@ with st.sidebar:
     st.subheader("🧠 Strategy")
     st.markdown(
         f"- EMA {config.EMA_FAST} / {config.EMA_SLOW} + VWAP trend filter\n"
-        f"- RSI{config.RSI_PERIOD} bounce: < {config.RSI_OVERSOLD} → long, "
-        f"> {config.RSI_OVERBOUGHT} → short (lookback {config.RSI_LOOKBACK})\n"
+        f"- RSI{config.RSI_PERIOD} pullback in trend: dip < {config.RSI_PULLBACK_LONG} → long, "
+        f"spike > {config.RSI_PULLBACK_SHORT} → short (lookback {config.RSI_LOOKBACK})\n"
         f"- Loop every **{config.LOOP_INTERVAL}s**"
     )
+
+
+market = markets.get(selected) or {}
+candles: pd.DataFrame | None = market.get("candles")
+last_price = market.get("last_price")
+position = positions.get(selected)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +169,7 @@ st.markdown(
     <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:8px">
       <span style="background:{color};color:white;padding:6px 16px;border-radius:999px;
                    font-weight:700;letter-spacing:1px">● {status}</span>
-      <span style="font-size:1.05rem"><b>{snap.get('symbol')}</b> {price_txt}</span>
+      <span style="font-size:1.05rem"><b>{selected}</b> {price_txt}</span>
       <span style="color:#888">Last update: {fmt_dt(snap.get('last_update'))}
         · Iterations: {snap.get('iterations', 0)}{extra}</span>
     </div>
@@ -205,8 +217,9 @@ with chart_col:
                                  line=dict(color="#a855f7", width=1.5, dash="dot")), row=1, col=1)
 
         # Trade markers (only those inside the visible window)
-        if trades:
-            tdf = pd.DataFrame(trades)
+        sym_trades = [t for t in trades if t.get("symbol") == selected]
+        if sym_trades:
+            tdf = pd.DataFrame(sym_trades)
             t0 = x.min()
             tdf = tdf[pd.to_datetime(tdf["exit_time"], utc=True) >= t0]
             for side, sym, col in (("LONG", "triangle-up", "#16a34a"), ("SHORT", "triangle-down", "#dc2626")):
@@ -237,7 +250,7 @@ with chart_col:
         # RSI panel
         fig.add_trace(go.Scatter(x=x, y=candles["RSI"], name=f"RSI{config.RSI_PERIOD}",
                                  line=dict(color="#06b6d4", width=1.3)), row=2, col=1)
-        for lvl in (config.RSI_OVERSOLD, config.RSI_OVERBOUGHT):
+        for lvl in (config.RSI_PULLBACK_LONG, config.RSI_PULLBACK_SHORT):
             fig.add_hline(y=lvl, line=dict(color="#6b7280", dash="dot", width=1), row=2, col=1)
 
         fig.update_layout(height=620, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark",
@@ -249,17 +262,37 @@ with chart_col:
 
         last = candles.iloc[-1]
         st.caption(
-            f"EMA{config.EMA_FAST} {last['EMA_FAST']:.2f} · EMA{config.EMA_SLOW} {last['EMA_SLOW']:.2f} · "
-            f"VWAP {last['VWAP']:.2f} · RSI {last['RSI']:.1f} · ATR {last['ATR']:.2f} · "
-            f"Last signal: {snap.get('last_signal') or '—'} ({fmt_dt(snap.get('last_signal_time'))})"
+            f"EMA{config.EMA_FAST} {last['EMA_FAST']:.6g} · EMA{config.EMA_SLOW} {last['EMA_SLOW']:.6g} · "
+            f"VWAP {last['VWAP']:.6g} · RSI {last['RSI']:.1f} · ATR {last['ATR']:.4g} · "
+            f"Last {selected} signal: {market.get('last_signal') or '—'} ({fmt_dt(market.get('last_signal_time'))})"
         )
+        diag = market.get("diagnostics")
+        if diag and diag.get("reason"):
+            st.caption(f"🔎 Last closed candle: **{diag.get('signal') or 'no signal'}** — {diag['reason']}")
+
+    # Overview of every scanned symbol
+    rows = []
+    for sym in symbols:
+        m = markets.get(sym) or {}
+        d = m.get("diagnostics") or {}
+        rows.append({
+            "Symbol": sym,
+            "Price": m.get("last_price"),
+            "Trend": d.get("trend") or "—",
+            "RSI": round(d["rsi"], 1) if d.get("rsi") is not None else None,
+            "Status": d.get("reason") or (m.get("error") or "waiting for data"),
+            "Last signal": f"{m.get('last_signal')} {pd.Timestamp(m['last_signal_time']).strftime('%H:%M')}"
+                           if m.get("last_signal") else "—",
+            "Position": positions[sym]["side"] if sym in positions else "",
+        })
+    st.dataframe(pd.DataFrame(rows), **STRETCH, hide_index=True)
 
 with pos_col:
-    st.subheader("🎯 Active Position")
-    if not position:
+    st.subheader("🎯 Active Positions")
+    if not positions:
         st.info("No open position — scanning for signals.")
-    else:
-        cur = last_price or position.get("current_price") or position["entry_price"]
+    for sym, position in positions.items():
+        cur = (markets.get(sym) or {}).get("last_price") or position.get("current_price") or position["entry_price"]
         direction = 1 if position["side"] == "LONG" else -1
         upnl = (cur - position["entry_price"]) * position["qty"] * direction
         upnl_pct = (cur / position["entry_price"] - 1) * 100 * direction
@@ -271,16 +304,16 @@ with pos_col:
             <div style="border:1px solid #333;border-radius:12px;padding:14px;line-height:1.9">
               <span style="background:{side_color};color:white;padding:3px 12px;border-radius:6px;
                            font-weight:700">{position['side']}</span>
-              &nbsp;<b>{position['qty']:.5f}</b> {position['symbol'].split('/')[0]}<br>
-              Entry: <b>{position['entry_price']:,.2f}</b><br>
-              Current: <b>{cur:,.2f}</b><br>
+              &nbsp;<b>{position['qty']:g}</b> {position['symbol'].split('/')[0]}<br>
+              Entry: <b>{position['entry_price']:,.6g}</b><br>
+              Current: <b>{cur:,.6g}</b><br>
               PnL: <b style="color:{pnl_color}">{upnl:+,.2f} &#36; ({upnl_pct:+.3f}%)</b><br>
-              <span style="color:#dc2626">SL: {position['sl']:,.2f}</span><br>
-              <span style="color:#16a34a">TP: {position['tp']:,.2f}</span><br>
+              <span style="color:#dc2626">SL: {position['sl']:,.6g}</span><br>
+              <span style="color:#16a34a">TP: {position['tp']:,.6g}</span><br>
               Notional: {position['entry_price'] * position['qty']:,.2f} &#36;<br>
               Entry fee: {position['entry_fee']:.4f} &#36;<br>
               Duration: <b>{fmt_duration(duration)}</b>
-            </div>
+            </div><div style="height:8px"></div>
             """,
             unsafe_allow_html=True,
         )
@@ -306,15 +339,16 @@ else:
     hist = pd.DataFrame(trades).sort_values("exit_time", ascending=False)
     view = pd.DataFrame({
         "#": hist["id"],
+        "Symbol": hist["symbol"],
         "Side": hist["side"],
-        "Qty": hist["qty"].round(5),
+        "Qty": hist["qty"],
         "Entry Time": pd.to_datetime(hist["entry_time"], utc=True).dt.strftime("%m-%d %H:%M:%S"),
         "Exit Time": pd.to_datetime(hist["exit_time"], utc=True).dt.strftime("%m-%d %H:%M:%S"),
         "Duration": hist["duration_sec"].apply(fmt_duration),
-        "Entry": hist["entry_price"].round(2),
-        "Exit": hist["exit_price"].round(2),
-        "SL": hist["sl"].round(2),
-        "TP": hist["tp"].round(2),
+        "Entry": hist["entry_price"].map(lambda v: float(f"{v:.6g}")),
+        "Exit": hist["exit_price"].map(lambda v: float(f"{v:.6g}")),
+        "SL": hist["sl"].map(lambda v: float(f"{v:.6g}")),
+        "TP": hist["tp"].map(lambda v: float(f"{v:.6g}")),
         "Gross PnL": hist["gross_pnl"].round(4),
         "Fees": hist["total_fees"].round(4),
         "Slippage $": hist["slippage_cost"].round(4),

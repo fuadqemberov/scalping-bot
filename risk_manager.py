@@ -42,9 +42,18 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Sizing
     # ------------------------------------------------------------------
-    def calculate_position_size(self, equity: float, entry_price: float, sl_price: float) -> float:
+    def calculate_position_size(
+        self,
+        equity: float,
+        entry_price: float,
+        sl_price: float,
+        qty_step: Optional[float] = None,
+        min_qty: Optional[float] = None,
+    ) -> float:
         """Quantity such that a stop-out loses <= risk_per_trade * equity (incl. costs).
 
+        ``qty_step`` / ``min_qty`` come from the exchange market of the symbol
+        (e.g. 0.00001 BTC, 0.0001 ETH, 0.1 XRP); config values are fallbacks.
         Returns 0.0 if the trade cannot be sized sensibly.
         """
         try:
@@ -67,9 +76,12 @@ class RiskManager:
                 qty = max_qty
 
             # Floor to exchange precision so we never exceed the risk budget
-            factor = 10 ** config.QTY_PRECISION
-            qty = math.floor(qty * factor) / factor
-            return qty if qty >= config.MIN_QTY else 0.0
+            step = qty_step if qty_step and qty_step > 0 else 10 ** -config.QTY_PRECISION
+            qty = math.floor(qty / step + 1e-9) * step
+            decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+            qty = round(qty, decimals)
+            floor_qty = min_qty if min_qty and min_qty > 0 else config.MIN_QTY
+            return qty if qty >= floor_qty and qty > 0 else 0.0
         except Exception:  # defensive: sizing must never crash the loop
             logger.exception("Position sizing failed")
             return 0.0

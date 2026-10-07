@@ -9,9 +9,21 @@ contains "magic numbers". Edit values, then restart the app.
 # Market / data source
 # ---------------------------------------------------------------------------
 EXCHANGE = "binance"            # Any ccxt exchange id with public OHLCV
-SYMBOL = "BTC/USDT"
+# Symbols scanned every iteration. Each one is evaluated independently and
+# can hold its own position (capped by MAX_OPEN_POSITIONS below).
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+SYMBOL = SYMBOLS[0]             # Backwards-compatible alias (primary symbol)
+
+# 1m is the shortest *sensible* timeframe for this strategy. Do NOT use "1s":
+#   * only Binance spot offers 1s klines - the OKX/KuCoin fallbacks do not
+#     (the bot refuses exchanges that don't support the timeframe);
+#   * the loop runs every LOOP_INTERVAL (10s), so it would skip most 1s bars;
+#   * a 1s ATR is a few dollars on BTC, i.e. far below the ~0.1-0.16%
+#     round-trip fees+slippage - every trade would lose money by design;
+#   * RSI14/EMA21 on 1s bars is mostly noise; VWAP over 300 bars = 5 minutes.
+# If anything, moving UP to "3m"/"5m" makes the TP clear costs more often.
 TIMEFRAME = "1m"
-CANDLE_LIMIT = 100              # Candles fetched per iteration
+CANDLE_LIMIT = 300              # Candles fetched per iteration (OKX max is 300)
 
 # Binance blocks some regions (HTTP 451). If the primary exchange is
 # unreachable at start-up, these public-data fallbacks are tried in order.
@@ -40,7 +52,10 @@ RISK_PER_TRADE = 0.01           # 1 % of equity risked per trade (incl. costs)
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
 SUSPENSION_HOURS = 24           # Trading halt duration after a breach
 MAX_LEVERAGE = 10.0             # Cap on position notional / equity
-QTY_PRECISION = 5               # Decimal places for order quantity (BTC)
+MAX_OPEN_POSITIONS = 3          # Max simultaneous positions across all symbols
+# Fallbacks only - the real amount step / minimum come from the exchange's
+# market metadata for each symbol.
+QTY_PRECISION = 5               # Decimal places for order quantity
 MIN_QTY = 0.00001               # Smallest tradable quantity
 
 # ---------------------------------------------------------------------------
@@ -51,9 +66,20 @@ EMA_SLOW = 21
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
-RSI_OVERSOLD = 35               # LONG: RSI dipped below this, now back above
-RSI_OVERBOUGHT = 65             # SHORT: RSI spiked above this, now back below
-RSI_LOOKBACK = 3                # Bars to look back for the RSI extreme
+# Pullback-in-trend entry. The old 35/65 levels contradicted the trend
+# filter: in a 1m uptrend (close > VWAP, EMA9 > EMA21) RSI almost never
+# drops below 35, so LONG/SHORT fired roughly once every ~100 hours.
+#   LONG : uptrend + RSI dipped below RSI_PULLBACK_LONG in the last
+#          RSI_LOOKBACK bars and has now turned back up above it.
+#   SHORT: downtrend + RSI rose above RSI_PULLBACK_SHORT and turned back down.
+# 45/55 gives roughly 1 signal per symbol per hour on 1m data. Lower values
+# (40/60) = fewer, deeper pullbacks; 50/50 = many more, noisier signals.
+RSI_PULLBACK_LONG = 45
+RSI_PULLBACK_SHORT = 55
+RSI_LOOKBACK = 3                # Bars to look back for the pullback
+# Old names kept so older code/dashboards keep working
+RSI_OVERSOLD = RSI_PULLBACK_LONG
+RSI_OVERBOUGHT = RSI_PULLBACK_SHORT
 
 VWAP_RESET_DAILY = True         # Anchor VWAP to the UTC session (intraday)
 
@@ -78,7 +104,10 @@ LOOP_INTERVAL = 10              # Seconds between bot iterations
 MAX_BACKOFF_SECONDS = 60        # Cap for exponential back-off on errors
 REQUEST_TIMEOUT_MS = 10000      # ccxt HTTP timeout
 UI_REFRESH_MS = 2500            # Dashboard auto-refresh interval
-LOG_BUFFER_SIZE = 300           # Log lines kept in memory for the dashboard
+LOG_BUFFER_SIZE = 500           # Log lines kept in memory for the dashboard
+# Log one line per symbol per closed candle explaining why there was / wasn't
+# a signal (trend state, RSI, what is still missing).
+LOG_SIGNAL_DIAGNOSTICS = True
 
 # ---------------------------------------------------------------------------
 # Logging
