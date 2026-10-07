@@ -128,13 +128,22 @@ with st.sidebar:
     )
 
     st.subheader("⚙️ Risk Parameters")
+    if config.POSITION_SIZING_MODE == "margin":
+        sizing_txt = (
+            f"- Order size: **{config.MARGIN_PER_TRADE * 100:.0f}%** of balance as margin "
+            f"× **{config.LEVERAGE:g}x** = **{config.MARGIN_PER_TRADE * config.LEVERAGE * 100:.0f}%** notional\n"
+        )
+    else:
+        sizing_txt = (
+            f"- Risk / trade: **{config.RISK_PER_TRADE * 100:.2f}%** of equity\n"
+            f"- Max leverage: **{config.MAX_LEVERAGE:.0f}×**\n"
+        )
     st.markdown(
-        f"- Risk / trade: **{config.RISK_PER_TRADE * 100:.2f}%** of equity\n"
-        f"- Daily DD limit: **{config.DAILY_DRAWDOWN_LIMIT * 100:.1f}%** "
+        sizing_txt
+        + f"- Daily DD limit: **{config.DAILY_DRAWDOWN_LIMIT * 100:.1f}%** "
         f"(halt {config.SUSPENSION_HOURS}h)\n"
         f"- SL: **{config.SL_ATR_MULTIPLIER} × ATR{config.ATR_PERIOD}**\n"
         f"- TP: **{config.RR_RATIO} R**\n"
-        f"- Max leverage: **{config.MAX_LEVERAGE:.0f}×**\n"
         f"- Fee: **{config.FEE_RATE * 100:.3f}%** / side\n"
         f"- Slippage: **{config.SLIPPAGE_MIN * 100:.2f}–{config.SLIPPAGE_MAX * 100:.2f}%**"
     )
@@ -311,6 +320,10 @@ with pos_col:
               <span style="color:#dc2626">SL: {position['sl']:,.6g}</span><br>
               <span style="color:#16a34a">TP: {position['tp']:,.6g}</span><br>
               Notional: {position['entry_price'] * position['qty']:,.2f} &#36;<br>
+              {f"Leverage: <b>{position['leverage']:g}x</b> · Margin: {position['margin']:,.2f} &#36;<br>"
+               f"ROE: <b style='color:{pnl_color}'>{upnl / position['margin'] * 100:+.2f}%</b><br>"
+               f"<span style='color:#f97316'>Liq: {position['liq_price']:,.6g}</span><br>"
+               if position.get('margin') else ""}
               Entry fee: {position['entry_fee']:.4f} &#36;<br>
               Duration: <b>{fmt_duration(duration)}</b>
             </div><div style="height:8px"></div>

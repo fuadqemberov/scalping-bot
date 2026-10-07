@@ -76,15 +76,51 @@ class RiskManager:
                 qty = max_qty
 
             # Floor to exchange precision so we never exceed the risk budget
-            step = qty_step if qty_step and qty_step > 0 else 10 ** -config.QTY_PRECISION
-            qty = math.floor(qty / step + 1e-9) * step
-            decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-            qty = round(qty, decimals)
-            floor_qty = min_qty if min_qty and min_qty > 0 else config.MIN_QTY
-            return qty if qty >= floor_qty and qty > 0 else 0.0
+            return self._round_qty(qty, qty_step, min_qty)
         except Exception:  # defensive: sizing must never crash the loop
             logger.exception("Position sizing failed")
             return 0.0
+
+    def calculate_margin_size(
+        self,
+        balance: float,
+        entry_price: float,
+        used_margin: float = 0.0,
+        margin_pct: float = config.MARGIN_PER_TRADE,
+        leverage: float = config.LEVERAGE,
+        qty_step: Optional[float] = None,
+        min_qty: Optional[float] = None,
+    ) -> float:
+        """Fixed-margin sizing: margin = margin_pct * balance, notional = margin * leverage.
+
+        Returns 0.0 if the free balance cannot cover the margin plus the
+        entry fee, or the trade cannot be sized sensibly.
+        """
+        try:
+            if balance <= 0 or entry_price <= 0 or margin_pct <= 0 or leverage <= 0:
+                return 0.0
+            margin = balance * margin_pct
+            notional = margin * leverage
+            entry_fee = notional * (self.fee_rate + self.max_slippage)
+            free = balance - used_margin
+            if margin + entry_fee > free:
+                logger.info("Not enough free balance for margin %.2f (free %.2f, used %.2f)",
+                            margin, free, used_margin)
+                return 0.0
+            return self._round_qty(notional / entry_price, qty_step, min_qty)
+        except Exception:
+            logger.exception("Margin sizing failed")
+            return 0.0
+
+    @staticmethod
+    def _round_qty(qty: float, qty_step: Optional[float], min_qty: Optional[float]) -> float:
+        """Floor qty to the market's amount step; 0.0 if below the minimum."""
+        step = qty_step if qty_step and qty_step > 0 else 10 ** -config.QTY_PRECISION
+        qty = math.floor(qty / step + 1e-9) * step
+        decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+        qty = round(qty, decimals)
+        floor_qty = min_qty if min_qty and min_qty > 0 else config.MIN_QTY
+        return qty if qty >= floor_qty and qty > 0 else 0.0
 
     def estimate_round_trip_cost(self, entry_price: float, qty: float) -> float:
         """Worst-case fees + slippage for opening and closing a position."""

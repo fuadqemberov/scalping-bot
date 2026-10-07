@@ -139,8 +139,12 @@ class PaperEngine:
         sl: float,
         tp: float,
         symbol: Optional[str] = None,
+        leverage: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Open a market position with simulated slippage and entry fee.
+
+        With ``leverage`` the position is treated as isolated margin:
+        margin = notional / leverage and a liquidation price is computed.
 
         Returns a copy of the new position dict, or None if rejected.
         """
@@ -172,6 +176,17 @@ class PaperEngine:
                 logger.warning("Order rejected: insufficient balance for fees")
                 return None
 
+            margin = notional / leverage if leverage and leverage > 0 else None
+            liq_price = None
+            if margin is not None:
+                if margin + fee > self.balance - self._used_margin_unlocked():
+                    logger.warning("Order rejected: insufficient free balance for margin %.2f", margin)
+                    return None
+                # Isolated margin: liquidated when loss = margin - maintenance margin
+                mmr = config.MAINTENANCE_MARGIN_RATE
+                move = 1.0 / leverage - mmr
+                liq_price = fill * (1 - move) if side == "LONG" else fill * (1 + move)
+
             self.balance -= fee
             self.daily_realized_pnl -= fee
             self._trade_counter += 1
@@ -190,6 +205,9 @@ class PaperEngine:
                 "entry_time": _utcnow(),
                 "unrealized_pnl": 0.0,
                 "current_price": price,
+                "leverage": leverage,
+                "margin": margin,
+                "liq_price": liq_price,
             }
             pos["unrealized_pnl"] = self._unrealized(pos, price)
             self.positions[symbol] = pos
@@ -197,8 +215,10 @@ class PaperEngine:
             self._update_drawdown_stats()
 
             logger.info(
-                "OPEN %s #%d %s qty=%.5f ref=%.2f fill=%.2f SL=%.2f TP=%.2f fee=%.4f",
+                "OPEN %s #%d %s qty=%g ref=%.6g fill=%.6g SL=%.6g TP=%.6g fee=%.4f%s",
                 side, pos["id"], symbol, qty, price, fill, sl, tp, fee,
+                f" | {leverage:g}x margin={margin:.2f} notional={notional:.2f} liq={liq_price:.6g}"
+                if margin is not None else "",
             )
             return copy.deepcopy(pos)
 
@@ -252,6 +272,9 @@ class PaperEngine:
                 "net_pnl": net,
                 "pnl_pct": (net / entry_notional * 100) if entry_notional else 0.0,
                 "exit_reason": reason,
+                "leverage": pos.get("leverage"),
+                "margin": pos.get("margin"),
+                "roe_pct": (net / pos["margin"] * 100) if pos.get("margin") else None,
                 "balance_after": self.balance,
             }
             self.trade_history.append(trade)
@@ -293,6 +316,10 @@ class PaperEngine:
             if pos is None:
                 return None
             side, sl, tp = pos["side"], pos["sl"], pos["tp"]
+            liq = pos.get("liq_price")
+            if liq is not None and ((side == "LONG" and current_price <= liq)
+                                    or (side == "SHORT" and current_price >= liq)):
+                return self._liquidate(pos, symbol)
             if side == "LONG":
                 if current_price <= sl:
                     return self.close_position(current_price, "STOP_LOSS", symbol)
@@ -304,6 +331,28 @@ class PaperEngine:
                 if current_price <= tp:
                     return self.close_position(tp, "TAKE_PROFIT", symbol)
             return None
+
+    def _used_margin_unlocked(self) -> float:
+        return sum(p.get("margin") or 0.0 for p in self.positions.values())
+
+    def get_used_margin(self) -> float:
+        with self._lock:
+            return self._used_margin_unlocked()
+
+    def _liquidate(self, pos: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
+        """Isolated-margin liquidation: the whole margin is lost (call with lock held)."""
+        logger.warning("LIQUIDATION %s #%d %s at %.6g", pos["side"], pos["id"], symbol, pos["liq_price"])
+        trade = self.close_position(pos["liq_price"], "LIQUIDATION", symbol)
+        if trade and pos.get("margin"):
+            # Loss can never exceed the isolated margin (+ fees already paid)
+            floor = -(pos["margin"] + trade["entry_fee"] + trade["exit_fee"])
+            if trade["net_pnl"] < floor:
+                diff = floor - trade["net_pnl"]
+                self.balance += diff
+                self.daily_realized_pnl += diff
+                self.trade_history[-1]["net_pnl"] = trade["net_pnl"] = floor
+                self.trade_history[-1]["balance_after"] = trade["balance_after"] = self.balance
+        return trade
 
     def get_equity(self) -> float:
         with self._lock:
@@ -358,6 +407,8 @@ class PaperEngine:
                 "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0),
                 "total_fees": sum(t["total_fees"] for t in trades) + open_fees,
                 "total_slippage": sum(t["slippage_cost"] for t in trades),
+                "used_margin": self._used_margin_unlocked(),
+                "free_balance": self.balance - self._used_margin_unlocked(),
                 "max_drawdown_pct": self.max_drawdown_pct * 100,
                 "daily_pnl": equity - self.day_start_equity,
                 "day_start_equity": self.day_start_equity,

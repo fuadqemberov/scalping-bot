@@ -552,7 +552,22 @@ class BotWorker:
 
         equity = self.engine.get_equity()
         step, min_qty = self._amount_rules(sym)
-        qty = self.risk.calculate_position_size(equity, price, sl, qty_step=step, min_qty=min_qty)
+        leverage = None
+        if getattr(config, "POSITION_SIZING_MODE", "risk") == "margin":
+            leverage = config.LEVERAGE
+            qty = self.risk.calculate_margin_size(
+                self.engine.balance, price, used_margin=self.engine.get_used_margin(),
+                qty_step=step, min_qty=min_qty,
+            )
+            # The stop must trigger before liquidation, otherwise skip the trade
+            mmr = config.MAINTENANCE_MARGIN_RATE
+            liq_move = (1.0 / leverage - mmr - config.SLIPPAGE_MAX) * price
+            if abs(price - sl) >= liq_move:
+                logger.warning("%s entry skipped: stop %.6g is beyond the %gx liquidation distance %.6g",
+                               sym, abs(price - sl), leverage, liq_move)
+                return
+        else:
+            qty = self.risk.calculate_position_size(equity, price, sl, qty_step=step, min_qty=min_qty)
         if qty <= 0:
             logger.warning("%s entry skipped: position size is zero (equity %.2f, stop %.6g)",
                            sym, equity, abs(price - sl))
@@ -566,7 +581,7 @@ class BotWorker:
                             sym, reward, costs)
                 return
 
-        self.engine.open_position(side, price, qty, sl, tp, symbol=sym)
+        self.engine.open_position(side, price, qty, sl, tp, symbol=sym, leverage=leverage)
 
     # ------------------------------------------------------------------
     # Publishing

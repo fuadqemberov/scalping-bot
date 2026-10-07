@@ -48,10 +48,22 @@ FEE_RATE = 0.0005               # 0.05 % taker fee, charged on entry AND exit
 # ---------------------------------------------------------------------------
 # Risk management
 # ---------------------------------------------------------------------------
-RISK_PER_TRADE = 0.01           # 1 % of equity risked per trade (incl. costs)
+# Position sizing mode:
+#   "margin" : every order uses MARGIN_PER_TRADE of the wallet balance as
+#              margin at LEVERAGE  -> notional = balance * 7% * 10 = 70 %
+#              of the balance per position.
+#   "risk"   : size so that a stop-out loses RISK_PER_TRADE of equity.
+POSITION_SIZING_MODE = "margin"
+MARGIN_PER_TRADE = 0.07         # 7 % of balance used as margin per order
+LEVERAGE = 10.0                 # 10x -> position notional = 10 x margin
+# Isolated-margin liquidation model: the position is liquidated when its loss
+# eats the margin down to the maintenance level (~-9.5 % price move at 10x).
+MAINTENANCE_MARGIN_RATE = 0.005  # 0.5 % of notional
+
+RISK_PER_TRADE = 0.01           # Used only in "risk" mode
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
 SUSPENSION_HOURS = 24           # Trading halt duration after a breach
-MAX_LEVERAGE = 10.0             # Cap on position notional / equity
+MAX_LEVERAGE = 10.0             # Cap on position notional / equity ("risk" mode)
 MAX_OPEN_POSITIONS = 3          # Max simultaneous positions across all symbols
 # Fallbacks only - the real amount step / minimum come from the exchange's
 # market metadata for each symbol.
