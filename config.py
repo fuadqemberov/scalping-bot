@@ -22,7 +22,13 @@ SYMBOL = SYMBOLS[0]             # Backwards-compatible alias (primary symbol)
 #     round-trip fees+slippage - every trade would lose money by design;
 #   * RSI14/EMA21 on 1s bars is mostly noise; VWAP over 300 bars = 5 minutes.
 # If anything, moving UP to "3m"/"5m" makes the TP clear costs more often.
-TIMEFRAME = "1m"
+#
+# Trade log analysis (58 trades on 1m): the median stop was 0.11 % and the
+# median target 0.11 % of price, while fees + slippage cost 0.14 % per round
+# trip. Gross PnL was +1 USDT, fees+slippage were -80 USDT: the edge was
+# eaten entirely by costs. On 5m bars ATR is ~2-3x larger, so the same cost
+# becomes a much smaller fraction of each target.
+TIMEFRAME = "5m"
 CANDLE_LIMIT = 300              # Candles fetched per iteration (OKX max is 300)
 
 # Binance blocks some regions (HTTP 451). If the primary exchange is
@@ -64,7 +70,15 @@ RISK_PER_TRADE = 0.01           # Used only in "risk" mode
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
 SUSPENSION_HOURS = 24           # Trading halt duration after a breach
 MAX_LEVERAGE = 10.0             # Cap on position notional / equity ("risk" mode)
-MAX_OPEN_POSITIONS = 3          # Max simultaneous positions across all symbols
+MAX_OPEN_POSITIONS = 2          # Max simultaneous positions across all symbols
+# BTC/ETH/SOL/BNB/XRP move together on short timeframes, so 3 longs at once
+# are effectively one 3x-sized bet (the log shows 3 longs stopped out
+# together at 17:19-17:24 and pairs at 01:35 and 05:01). Allow at most this
+# many open positions in the same direction.
+MAX_SAME_SIDE_POSITIONS = 1
+# After a stop-loss on a symbol, ignore its signals for this many bars
+# (stops BNB-style whipsaw: short stopped, long, short stopped again...).
+SL_COOLDOWN_BARS = 3
 # Fallbacks only - the real amount step / minimum come from the exchange's
 # market metadata for each symbol.
 QTY_PRECISION = 5               # Decimal places for order quantity
@@ -96,18 +110,19 @@ RSI_OVERBOUGHT = RSI_PULLBACK_SHORT
 VWAP_RESET_DAILY = True         # Anchor VWAP to the UTC session (intraday)
 
 SL_ATR_MULTIPLIER = 1.5         # Stop distance = 1.5 x ATR
-RR_RATIO = 1.5                  # Take-profit distance = RR x stop distance
+RR_RATIO = 2.0                  # Take-profit distance = RR x stop distance
 
 # Close the open position when an opposite signal appears, then (optionally)
 # enter in the new direction on the same signal.
 EXIT_ON_REVERSAL = True
 ENTER_ON_REVERSAL = True
 
-# Skip trades whose gross take-profit would not even cover round-trip
-# fees + worst-case slippage (prevents "winning" trades that still lose money
-# when ATR is tiny). Note: on quiet 1m BTC markets this filters out MOST
-# setups, because ~0.16% round-trip costs often exceed 2.25 x ATR.
-SKIP_IF_TP_BELOW_COSTS = False
+# Skip trades whose take-profit distance is smaller than this multiple of
+# the worst-case round-trip cost (2 x (fee + max slippage) = 0.16 %).
+# With 2.0 the target must be >= 0.32 % of price, so costs eat at most half
+# of a winner. In the 1m log 20 of 36 TAKE_PROFIT trades still lost money
+# because the target was smaller than the costs. Set 0 to disable.
+MIN_TP_COST_MULTIPLE = 2.0
 
 # ---------------------------------------------------------------------------
 # Loop / UI

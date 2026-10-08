@@ -143,7 +143,9 @@ with st.sidebar:
         + f"- Daily DD limit: **{config.DAILY_DRAWDOWN_LIMIT * 100:.1f}%** "
         f"(halt {config.SUSPENSION_HOURS}h)\n"
         f"- SL: **{config.SL_ATR_MULTIPLIER} × ATR{config.ATR_PERIOD}**\n"
-        f"- TP: **{config.RR_RATIO} R**\n"
+        f"- TP: **{config.RR_RATIO} R** (min **{config.MIN_TP_COST_MULTIPLE:g}×** round-trip costs)\n"
+        f"- Max same-side positions: **{config.MAX_SAME_SIDE_POSITIONS}** · "
+        f"SL cooldown: **{config.SL_COOLDOWN_BARS}** bars\n"
         f"- Fee: **{config.FEE_RATE * 100:.3f}%** / side\n"
         f"- Slippage: **{config.SLIPPAGE_MIN * 100:.2f}–{config.SLIPPAGE_MAX * 100:.2f}%**"
     )

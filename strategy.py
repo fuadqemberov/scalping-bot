@@ -240,3 +240,26 @@ def calculate_sl_tp(
     if side == "SHORT":
         return entry_price + stop_dist, entry_price - target_dist
     raise ValueError(f"invalid side {side!r}")
+
+
+def round_trip_cost_pct(fee_rate: float = config.FEE_RATE,
+                        max_slippage: float = config.SLIPPAGE_MAX) -> float:
+    """Worst-case fees + slippage for entry and exit, as a fraction of price."""
+    return 2.0 * (fee_rate + max_slippage)
+
+
+def check_trade_costs(entry_price: float, tp: float,
+                      multiple: float = getattr(config, "MIN_TP_COST_MULTIPLE", 0.0)) -> Tuple[bool, str]:
+    """(ok, reason): is the take-profit distance large enough to beat costs?
+
+    A trade is only worth taking when the target is at least ``multiple``
+    times the round-trip cost; otherwise even a winner nets ~nothing.
+    """
+    if multiple <= 0 or entry_price <= 0:
+        return True, ""
+    tp_pct = abs(tp - entry_price) / entry_price
+    need = multiple * round_trip_cost_pct()
+    if tp_pct < need:
+        return False, (f"TP distance {tp_pct * 100:.3f}% < {multiple:g}x round-trip "
+                       f"costs ({need * 100:.3f}%) - ATR too small")
+    return True, ""

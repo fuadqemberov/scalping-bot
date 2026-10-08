@@ -24,7 +24,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -222,6 +222,7 @@ class BotWorker:
         self._trade_lock = threading.Lock()     # serialises trading actions (loop vs. kill switch)
         self._last_processed_candle_ts: Dict[str, pd.Timestamp] = {}
         self._last_prices: Dict[str, float] = {}
+        self._cooldown_until: Dict[str, datetime] = {}   # symbol -> no entries before this time
         self._consecutive_errors = 0
 
     # ------------------------------------------------------------------
@@ -450,6 +451,7 @@ class BotWorker:
                 closed = self.engine.check_sl_tp(price, sym)
             if closed:
                 logger.info("%s exit by %s: net PnL %.4f USDT", sym, closed["exit_reason"], closed["net_pnl"])
+                self._start_cooldown_if_stopped(sym, closed)
         primary = self.symbols[0]
         self.state.update(last_price=prices.get(primary), last_price_time=now)
 
@@ -537,9 +539,15 @@ class BotWorker:
                                 signal, sym, self.risk.resume_time)
                 elif self._paused.is_set():
                     logger.info("Signal %s %s ignored - bot paused", signal, sym)
+                elif self._in_cooldown(sym):
+                    logger.info("Signal %s %s ignored - cooldown after stop-loss until %s",
+                                signal, sym, self._cooldown_until[sym].strftime("%H:%M:%S"))
                 elif open_count >= config.MAX_OPEN_POSITIONS:
                     logger.info("Signal %s %s ignored - MAX_OPEN_POSITIONS (%d) reached",
                                 signal, sym, config.MAX_OPEN_POSITIONS)
+                elif self._same_side_count(signal) >= getattr(config, "MAX_SAME_SIDE_POSITIONS", 99):
+                    logger.info("Signal %s %s ignored - already %d %s position(s) open (correlated coins)",
+                                signal, sym, self._same_side_count(signal), signal)
                 else:
                     self._enter(sym, signal, price, float(closed_df["ATR"].iloc[-1]))
 
@@ -573,15 +581,42 @@ class BotWorker:
                            sym, equity, abs(price - sl))
             return
 
-        if config.SKIP_IF_TP_BELOW_COSTS:
-            reward = abs(tp - price) * qty
-            costs = self.risk.estimate_round_trip_cost(price, qty)
-            if reward <= costs:
-                logger.info("%s entry skipped: TP reward %.4f <= round-trip costs %.4f (ATR too small)",
-                            sym, reward, costs)
-                return
+        ok, why = strategy.check_trade_costs(price, tp)
+        if not ok:
+            logger.info("%s entry skipped: %s", sym, why)
+            return
 
         self.engine.open_position(side, price, qty, sl, tp, symbol=sym, leverage=leverage)
+
+    # ------------------------------------------------------------------
+    # Entry filters
+    # ------------------------------------------------------------------
+    def _same_side_count(self, side: str) -> int:
+        """Open positions in ``side`` across all symbols (they are highly correlated)."""
+        count = 0
+        for s in self._open_symbols():
+            pos = self.engine.get_position(s)
+            if pos and pos["side"] == side:
+                count += 1
+        return count
+
+    def _start_cooldown_if_stopped(self, sym: str, trade: Dict[str, Any]) -> None:
+        bars = getattr(config, "SL_COOLDOWN_BARS", 0)
+        if bars <= 0 or trade.get("exit_reason") not in ("STOP_LOSS", "LIQUIDATION"):
+            return
+        until = datetime.now(timezone.utc) + timedelta(
+            seconds=bars * ccxt.Exchange.parse_timeframe(config.TIMEFRAME))
+        self._cooldown_until[sym] = until
+        logger.info("%s stopped out - no new %s entries until %s UTC", sym, sym, until.strftime("%H:%M:%S"))
+
+    def _in_cooldown(self, sym: str) -> bool:
+        until = self._cooldown_until.get(sym)
+        if until is None:
+            return False
+        if datetime.now(timezone.utc) >= until:
+            del self._cooldown_until[sym]
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Publishing

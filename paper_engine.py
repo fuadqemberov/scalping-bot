@@ -170,6 +170,13 @@ class PaperEngine:
                 return None
 
             fill = self._apply_slippage(price, side, is_entry=True)
+            # Re-anchor SL/TP to the actual fill so their distances stay as
+            # planned. Previously they were measured from the pre-slippage
+            # price, so entry slippage moved the fill toward the TP (shorts
+            # fill lower, longs higher) and shrank the reward: the log's
+            # average RR was ~1.0 instead of the configured 1.5.
+            shift = fill - price
+            sl, tp = sl + shift, tp + shift
             notional = fill * qty
             fee = notional * self.fee_rate
             if fee >= self.balance:
