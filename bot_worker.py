@@ -487,6 +487,8 @@ class BotWorker:
     def _process_symbol(self, sym: str, price: float, suspended: bool) -> None:
         candles = self._fetch_candles(sym)
         min_bars = max(config.EMA_SLOW, config.RSI_PERIOD + 1, config.ATR_PERIOD) + config.RSI_LOOKBACK + 2
+        if getattr(config, "EMA_TREND", 0) > 0:
+            min_bars = max(min_bars, config.EMA_TREND + config.EMA_TREND_SLOPE_BARS + 2)
         if candles.empty or len(candles) < min_bars:
             logger.warning("%s: not enough candle data (%d rows, need %d)", sym, len(candles), min_bars)
             return
@@ -558,27 +560,13 @@ class BotWorker:
             logger.warning("%s entry skipped: %s", sym, exc)
             return
 
-        equity = self.engine.get_equity()
         step, min_qty = self._amount_rules(sym)
-        leverage = None
-        if getattr(config, "POSITION_SIZING_MODE", "risk") == "margin":
-            leverage = config.LEVERAGE
-            qty = self.risk.calculate_margin_size(
-                self.engine.balance, price, used_margin=self.engine.get_used_margin(),
-                qty_step=step, min_qty=min_qty,
-            )
-            # The stop must trigger before liquidation, otherwise skip the trade
-            mmr = config.MAINTENANCE_MARGIN_RATE
-            liq_move = (1.0 / leverage - mmr - config.SLIPPAGE_MAX) * price
-            if abs(price - sl) >= liq_move:
-                logger.warning("%s entry skipped: stop %.6g is beyond the %gx liquidation distance %.6g",
-                               sym, abs(price - sl), leverage, liq_move)
-                return
-        else:
-            qty = self.risk.calculate_position_size(equity, price, sl, qty_step=step, min_qty=min_qty)
+        qty, leverage, why = self.risk.size_order(
+            self.engine.balance, self.engine.get_equity(), self.engine.get_used_margin(),
+            price, sl, qty_step=step, min_qty=min_qty,
+        )
         if qty <= 0:
-            logger.warning("%s entry skipped: position size is zero (equity %.2f, stop %.6g)",
-                           sym, equity, abs(price - sl))
+            logger.warning("%s entry skipped: %s", sym, why)
             return
 
         ok, why = strategy.check_trade_costs(price, tp)
@@ -602,6 +590,7 @@ class BotWorker:
 
     def _start_cooldown_if_stopped(self, sym: str, trade: Dict[str, Any]) -> None:
         bars = getattr(config, "SL_COOLDOWN_BARS", 0)
+        # BREAKEVEN_STOP exits are ~0 PnL, no cooldown for those
         if bars <= 0 or trade.get("exit_reason") not in ("STOP_LOSS", "LIQUIDATION"):
             return
         until = datetime.now(timezone.utc) + timedelta(

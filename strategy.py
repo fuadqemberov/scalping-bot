@@ -15,6 +15,12 @@ bot guarantees is a *closed* candle) - "buy the pullback in an uptrend":
             within the previous RSI_LOOKBACK bars and is now above it and rising.
     SHORT : close < VWAP, EMA_fast < EMA_slow, RSI was > RSI_PULLBACK_SHORT
             within the previous RSI_LOOKBACK bars and is now below it and falling.
+
+Confirmation filters (config, each optional) then veto weak signals:
+    * EMA200 trend: price on the right side of a sloping EMA200
+    * ADX >= ADX_MIN: the market is trending, not chopping sideways
+    * volume of the signal bar >= VOLUME_MIN_RATIO x 20-bar average
+    * the signal candle closes in the trade direction
 """
 
 from __future__ import annotations
@@ -97,6 +103,26 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series,
     return wilder(tr, period)
 
 
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's Average Directional Index (trend strength, 0-100)."""
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    plus_dm[up.isna()] = np.nan
+    minus_dm[down.isna()] = np.nan
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr[prev_close.isna()] = np.nan
+    atr_s = wilder(tr, period)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100.0 * wilder(plus_dm, period) / atr_s
+        minus_di = 100.0 * wilder(minus_dm, period) / atr_s
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    dx = dx.replace([np.inf, -np.inf], np.nan)
+    return wilder(dx, period)
+
+
 def vwap(df: pd.DataFrame, reset_daily: bool = config.VWAP_RESET_DAILY) -> pd.Series:
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = typical * df["volume"]
@@ -137,6 +163,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ATR"] = atr(out["high"], out["low"], out["close"], config.ATR_PERIOD)
     out["VWAP"] = vwap(out)
 
+    # Confirmation filters
+    if getattr(config, "EMA_TREND", 0) > 0:
+        out["EMA_TREND"] = ema(out["close"], config.EMA_TREND)
+        out["EMA_TREND_SLOPE"] = out["EMA_TREND"] - out["EMA_TREND"].shift(config.EMA_TREND_SLOPE_BARS)
+    out["ADX"] = adx(out["high"], out["low"], out["close"], getattr(config, "ADX_PERIOD", 14))
+    vol_n = getattr(config, "VOLUME_SMA_PERIOD", 20)
+    # Average of the bars BEFORE the signal bar, so the signal bar is compared to its past
+    out["VOL_SMA"] = out["volume"].shift(1).rolling(vol_n, min_periods=vol_n).mean()
+
     # Human-readable names (e.g. EMA9, EMA21, RSI14, ATR14)
     out[f"EMA{config.EMA_FAST}"] = out["EMA_FAST"]
     out[f"EMA{config.EMA_SLOW}"] = out["EMA_SLOW"]
@@ -158,7 +193,8 @@ def evaluate_signal(df: pd.DataFrame) -> Dict[str, Any]:
     lookback = config.RSI_LOOKBACK
     lo, hi = config.RSI_PULLBACK_LONG, config.RSI_PULLBACK_SHORT
     result: Dict[str, Any] = {"signal": None, "trend": None, "rsi": None,
-                              "rsi_min": None, "rsi_max": None, "reason": ""}
+                              "rsi_min": None, "rsi_max": None, "reason": "",
+                              "filters_failed": []}
     if df is None or len(df) < lookback + 2:
         result["reason"] = "not enough bars"
         return result
@@ -210,7 +246,50 @@ def evaluate_signal(df: pd.DataFrame) -> Dict[str, Any]:
             f"no clear trend (close {'>' if above_vwap else '<'} VWAP, "
             f"EMA{config.EMA_FAST} {'>' if ema_up else '<'} EMA{config.EMA_SLOW})"
         )
+
+    if result["signal"]:
+        failed = confirmation_failures(last, result["signal"])
+        result["filters_failed"] = failed
+        if failed:
+            result["reason"] = f"{result['signal']} filtered out: {'; '.join(failed)}"
+            result["signal"] = None
     return result
+
+
+def confirmation_failures(row: pd.Series, side: str) -> list:
+    """Extra checks on the signal bar. Returns the list of failed checks (empty = OK)."""
+    failed = []
+    d = 1 if side == "LONG" else -1
+
+    if getattr(config, "EMA_TREND", 0) > 0:
+        trend, slope = row.get("EMA_TREND"), row.get("EMA_TREND_SLOPE")
+        if trend is None or pd.isna(trend) or pd.isna(slope):
+            failed.append(f"EMA{config.EMA_TREND} warming up")
+        elif (row["close"] - trend) * d <= 0:
+            failed.append(f"close {'below' if d > 0 else 'above'} EMA{config.EMA_TREND}")
+        elif slope * d <= 0:
+            failed.append(f"EMA{config.EMA_TREND} {'falling' if d > 0 else 'rising'}")
+
+    adx_min = getattr(config, "ADX_MIN", 0)
+    if adx_min > 0:
+        a = row.get("ADX")
+        if a is None or pd.isna(a):
+            failed.append("ADX warming up")
+        elif a < adx_min:
+            failed.append(f"ADX {a:.1f} < {adx_min} (choppy)")
+
+    vol_ratio = getattr(config, "VOLUME_MIN_RATIO", 0)
+    if vol_ratio > 0:
+        avg = row.get("VOL_SMA")
+        if avg is None or pd.isna(avg) or avg <= 0:
+            failed.append("volume average warming up")
+        elif row["volume"] < vol_ratio * avg:
+            failed.append(f"volume {row['volume'] / avg:.2f}x avg < {vol_ratio:g}x")
+
+    if getattr(config, "REQUIRE_CONFIRM_CANDLE", False) and "open" in row:
+        if (row["close"] - row["open"]) * d <= 0:
+            failed.append(f"signal candle is not {'green' if d > 0 else 'red'}")
+    return failed
 
 
 def generate_signal(df: pd.DataFrame) -> Optional[str]:

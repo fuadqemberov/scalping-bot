@@ -144,6 +144,8 @@ with st.sidebar:
         f"(halt {config.SUSPENSION_HOURS}h)\n"
         f"- SL: **{config.SL_ATR_MULTIPLIER} × ATR{config.ATR_PERIOD}**\n"
         f"- TP: **{config.RR_RATIO} R** (min **{config.MIN_TP_COST_MULTIPLE:g}×** round-trip costs)\n"
+        f"- Max loss / trade: **{config.MAX_LOSS_PER_TRADE * 100:.2f}%** of balance · "
+        f"break-even at **{config.BREAKEVEN_TRIGGER_R:g}R**\n"
         f"- Max same-side positions: **{config.MAX_SAME_SIDE_POSITIONS}** · "
         f"SL cooldown: **{config.SL_COOLDOWN_BARS}** bars\n"
         f"- Fee: **{config.FEE_RATE * 100:.3f}%** / side\n"
@@ -154,6 +156,9 @@ with st.sidebar:
         f"- EMA {config.EMA_FAST} / {config.EMA_SLOW} + VWAP trend filter\n"
         f"- RSI{config.RSI_PERIOD} pullback in trend: dip < {config.RSI_PULLBACK_LONG} → long, "
         f"spike > {config.RSI_PULLBACK_SHORT} → short (lookback {config.RSI_LOOKBACK})\n"
+        f"- Filters: EMA{config.EMA_TREND} trend, ADX ≥ {config.ADX_MIN}, "
+        f"volume ≥ {config.VOLUME_MIN_RATIO:g}× avg, "
+        f"confirm candle {'on' if config.REQUIRE_CONFIRM_CANDLE else 'off'}\n"
         f"- Loop every **{config.LOOP_INTERVAL}s**"
     )
 

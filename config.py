@@ -30,6 +30,7 @@ SYMBOL = SYMBOLS[0]             # Backwards-compatible alias (primary symbol)
 # becomes a much smaller fraction of each target.
 TIMEFRAME = "5m"
 CANDLE_LIMIT = 300              # Candles fetched per iteration (OKX max is 300)
+                                # EMA_TREND=200 needs >= 200 bars, keep this >= 300
 
 # Binance blocks some regions (HTTP 451). If the primary exchange is
 # unreachable at start-up, these public-data fallbacks are tried in order.
@@ -61,15 +62,23 @@ FEE_RATE = 0.0005               # 0.05 % taker fee, charged on entry AND exit
 #   "risk"   : size so that a stop-out loses RISK_PER_TRADE of equity.
 POSITION_SIZING_MODE = "margin"
 MARGIN_PER_TRADE = 0.07         # 7 % of balance used as margin per order
-LEVERAGE = 10.0                 # 10x -> position notional = 10 x margin
+# 20x -> notional = 7 % x 20 = 140 % of balance per position. Leverage scales
+# wins AND losses (and fees) by the same factor, so it is paired with
+# MAX_LOSS_PER_TRADE below, which shrinks the order when the stop is wide.
+LEVERAGE = 20.0
+# Hard cap: a stop-out (incl. worst-case fees + slippage) may lose at most
+# this fraction of the balance. With 20x / 7 % margin the full size is used
+# while the stop is <= ~0.55 % away; wider stops get a smaller position.
+# Set 0 to disable.
+MAX_LOSS_PER_TRADE = 0.01
 # Isolated-margin liquidation model: the position is liquidated when its loss
-# eats the margin down to the maintenance level (~-9.5 % price move at 10x).
+# eats the margin down to the maintenance level (~-4.5 % price move at 20x).
 MAINTENANCE_MARGIN_RATE = 0.005  # 0.5 % of notional
 
 RISK_PER_TRADE = 0.01           # Used only in "risk" mode
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
 SUSPENSION_HOURS = 24           # Trading halt duration after a breach
-MAX_LEVERAGE = 10.0             # Cap on position notional / equity ("risk" mode)
+MAX_LEVERAGE = 20.0             # Cap on position notional / equity ("risk" mode)
 MAX_OPEN_POSITIONS = 2          # Max simultaneous positions across all symbols
 # BTC/ETH/SOL/BNB/XRP move together on short timeframes, so 3 longs at once
 # are effectively one 3x-sized bet (the log shows 3 longs stopped out
@@ -109,8 +118,26 @@ RSI_OVERBOUGHT = RSI_PULLBACK_SHORT
 
 VWAP_RESET_DAILY = True         # Anchor VWAP to the UTC session (intraday)
 
+# Extra signal confirmations (each can be switched off with 0 / False).
+# They run AFTER the pullback rule above and only remove signals.
+EMA_TREND = 200                 # Long-term trend: LONG only above a rising EMA200,
+                                # SHORT only below a falling one (~17h on 5m). 0 = off
+EMA_TREND_SLOPE_BARS = 10       # Bars used to measure the EMA200 slope
+ADX_PERIOD = 14
+ADX_MIN = 20                    # Skip choppy, trendless markets (ADX < 20). 0 = off
+VOLUME_SMA_PERIOD = 20
+VOLUME_MIN_RATIO = 1.0          # Signal bar volume >= 1.0 x 20-bar average. 0 = off
+REQUIRE_CONFIRM_CANDLE = True   # LONG needs a green signal bar, SHORT a red one
+
 SL_ATR_MULTIPLIER = 1.5         # Stop distance = 1.5 x ATR
 RR_RATIO = 2.0                  # Take-profit distance = RR x stop distance
+
+# Break-even stop: once price has moved BREAKEVEN_TRIGGER_R x the initial
+# stop distance in our favour, the stop is moved to entry + round-trip costs,
+# so a trade that was already +1R can no longer turn into a full loss.
+# Trade-off: some trades that would have dipped back and then hit the 2R
+# target are closed at ~0 instead. Set 0 to disable.
+BREAKEVEN_TRIGGER_R = 1.0
 
 # Close the open position when an opposite signal appears, then (optionally)
 # enter in the new direction on the same signal.

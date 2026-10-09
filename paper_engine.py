@@ -215,6 +215,9 @@ class PaperEngine:
                 "leverage": leverage,
                 "margin": margin,
                 "liq_price": liq_price,
+                "initial_sl": sl,
+                "risk_dist": abs(fill - sl),   # 1R in price units
+                "breakeven_moved": False,
             }
             pos["unrealized_pnl"] = self._unrealized(pos, price)
             self.positions[symbol] = pos
@@ -269,7 +272,8 @@ class PaperEngine:
                 "entry_price": pos["entry_price"],
                 "exit_price": fill,
                 "exit_reference_price": price,
-                "sl": pos["sl"],
+                "sl": pos.get("initial_sl", pos["sl"]),
+                "final_sl": pos["sl"],
                 "tp": pos["tp"],
                 "gross_pnl": gross,
                 "entry_fee": pos["entry_fee"],
@@ -327,17 +331,49 @@ class PaperEngine:
             if liq is not None and ((side == "LONG" and current_price <= liq)
                                     or (side == "SHORT" and current_price >= liq)):
                 return self._liquidate(pos, symbol)
+            self.apply_breakeven(current_price, symbol)
+            sl = pos["sl"]
+            stop_reason = "BREAKEVEN_STOP" if pos.get("breakeven_moved") else "STOP_LOSS"
             if side == "LONG":
                 if current_price <= sl:
-                    return self.close_position(current_price, "STOP_LOSS", symbol)
+                    return self.close_position(current_price, stop_reason, symbol)
                 if current_price >= tp:
                     return self.close_position(tp, "TAKE_PROFIT", symbol)
             else:
                 if current_price >= sl:
-                    return self.close_position(current_price, "STOP_LOSS", symbol)
+                    return self.close_position(current_price, stop_reason, symbol)
                 if current_price <= tp:
                     return self.close_position(tp, "TAKE_PROFIT", symbol)
             return None
+
+    def apply_breakeven(self, favorable_price: float, symbol: Optional[str] = None) -> bool:
+        """Move the stop to entry + costs once price reached BREAKEVEN_TRIGGER_R.
+
+        ``favorable_price`` is the best price seen (the ticker live, or the
+        bar high/low in a backtest). Returns True if the stop was moved now.
+        """
+        trigger_r = getattr(config, "BREAKEVEN_TRIGGER_R", 0.0)
+        symbol = symbol or self.symbol
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if not pos or trigger_r <= 0 or pos.get("breakeven_moved") or not pos.get("risk_dist"):
+                return False
+            d = self._direction(pos["side"])
+            entry = pos["entry_price"]
+            if (favorable_price - entry) * d < trigger_r * pos["risk_dist"]:
+                return False
+            # Cover both fees and the worst-case exit slippage
+            offset = entry * (2 * self.fee_rate + self.slippage_max)
+            new_sl = entry + d * offset
+            # Only tighten, and never put the stop beyond the current price
+            if (new_sl - pos["sl"]) * d <= 0 or (favorable_price - new_sl) * d <= 0:
+                return False
+            pos["sl"] = new_sl
+            pos["breakeven_moved"] = True
+            logger.info("BREAKEVEN %s #%d %s: SL %.6g -> %.6g (price %.6g reached %.1fR)",
+                        pos["side"], pos["id"], symbol, pos["initial_sl"], new_sl,
+                        favorable_price, trigger_r)
+            return True
 
     def _used_margin_unlocked(self) -> float:
         return sum(p.get("margin") or 0.0 for p in self.positions.values())

@@ -12,7 +12,7 @@ import logging
 import math
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import config
 
@@ -111,6 +111,45 @@ class RiskManager:
         except Exception:
             logger.exception("Margin sizing failed")
             return 0.0
+
+    def size_order(
+        self,
+        balance: float,
+        equity: float,
+        used_margin: float,
+        entry_price: float,
+        sl_price: float,
+        qty_step: Optional[float] = None,
+        min_qty: Optional[float] = None,
+    ) -> Tuple[float, Optional[float], str]:
+        """Size an order per config. Returns (qty, leverage or None, reason if qty == 0).
+
+        "margin" mode: fixed margin x LEVERAGE, then capped so a stop-out
+        loses at most MAX_LOSS_PER_TRADE of the balance (incl. costs), and
+        rejected if the stop sits beyond the liquidation price.
+        """
+        if getattr(config, "POSITION_SIZING_MODE", "risk") != "margin":
+            qty = self.calculate_position_size(equity, entry_price, sl_price, qty_step, min_qty)
+            return qty, None, "" if qty > 0 else "position size is zero"
+
+        leverage = config.LEVERAGE
+        stop_dist = abs(entry_price - sl_price)
+        liq_move = (1.0 / leverage - config.MAINTENANCE_MARGIN_RATE - self.max_slippage) * entry_price
+        if stop_dist >= liq_move:
+            return 0.0, leverage, (f"stop {stop_dist:.6g} is beyond the {leverage:g}x "
+                                   f"liquidation distance {liq_move:.6g}")
+
+        qty = self.calculate_margin_size(balance, entry_price, used_margin=used_margin,
+                                         leverage=leverage, qty_step=qty_step, min_qty=min_qty)
+        max_loss = getattr(config, "MAX_LOSS_PER_TRADE", 0.0)
+        if qty > 0 and max_loss > 0 and stop_dist > 0:
+            cost_per_unit = 2 * entry_price * (self.max_slippage + self.fee_rate)
+            cap = balance * max_loss / (stop_dist + cost_per_unit)
+            if cap < qty:
+                logger.info("Size cut by MAX_LOSS_PER_TRADE %.2f%%: %.6g -> %.6g",
+                            max_loss * 100, qty, cap)
+                qty = self._round_qty(cap, qty_step, min_qty)
+        return qty, leverage, "" if qty > 0 else "position size is zero"
 
     @staticmethod
     def _round_qty(qty: float, qty_step: Optional[float], min_qty: Optional[float]) -> float:
