@@ -62,23 +62,28 @@ FEE_RATE = 0.0005               # 0.05 % taker fee, charged on entry AND exit
 #   "risk"   : size so that a stop-out loses RISK_PER_TRADE of equity.
 POSITION_SIZING_MODE = "margin"
 MARGIN_PER_TRADE = 0.07         # 7 % of balance used as margin per order
-# 20x -> notional = 7 % x 20 = 140 % of balance per position. Leverage scales
-# wins AND losses (and fees) by the same factor, so it is paired with
-# MAX_LOSS_PER_TRADE below, which shrinks the order when the stop is wide.
-LEVERAGE = 20.0
+# 100x -> margin 7 % x 100 = up to 700 % of balance notional per position.
+# Leverage scales wins AND losses (and fees) by the same factor, so it is
+# paired with MAX_LOSS_PER_TRADE below, which shrinks the order so that one
+# stop-out still costs at most 1 % of the balance. At 100x the liquidation
+# price is only ~0.47 % away: any setup whose stop is farther than that is
+# skipped, and a fast wick can liquidate a position before its stop fills.
+# Note: real exchanges cap leverage per symbol (e.g. Binance: BTC 125x, many
+# altcoins 50-75x); this paper engine does not enforce those caps.
+LEVERAGE = 100.0
 # Hard cap: a stop-out (incl. worst-case fees + slippage) may lose at most
-# this fraction of the balance. With 20x / 7 % margin the full size is used
-# while the stop is <= ~0.55 % away; wider stops get a smaller position.
+# this fraction of the balance. At 100x this cap - not the leverage - sets
+# the position size (e.g. stop 0.37 % -> ~3,800 $ notional on 2,000 $).
 # Set 0 to disable.
 MAX_LOSS_PER_TRADE = 0.01
 # Isolated-margin liquidation model: the position is liquidated when its loss
-# eats the margin down to the maintenance level (~-4.5 % price move at 20x).
+# eats the margin down to the maintenance level (~-0.47 % price move at 100x).
 MAINTENANCE_MARGIN_RATE = 0.005  # 0.5 % of notional
 
 RISK_PER_TRADE = 0.01           # Used only in "risk" mode
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
 SUSPENSION_HOURS = 24           # Trading halt duration after a breach
-MAX_LEVERAGE = 20.0             # Cap on position notional / equity ("risk" mode)
+MAX_LEVERAGE = 100.0             # Cap on position notional / equity ("risk" mode)
 MAX_OPEN_POSITIONS = 2          # Max simultaneous positions across all symbols
 # BTC/ETH/SOL/BNB/XRP move together on short timeframes, so 3 longs at once
 # are effectively one 3x-sized bet (the log shows 3 longs stopped out
@@ -92,6 +97,22 @@ SL_COOLDOWN_BARS = 3
 # market metadata for each symbol.
 QTY_PRECISION = 5               # Decimal places for order quantity
 MIN_QTY = 0.00001               # Smallest tradable quantity
+
+# ---------------------------------------------------------------------------
+# Strategy selection
+# ---------------------------------------------------------------------------
+# Strategies evaluated on every closed candle, in priority order: the first
+# one that fires on a symbol opens the trade. Remove a name to switch it off.
+#   "trend_pullback"   : buy the dip / sell the rally inside a trend
+#                        (EMA9/21 + VWAP + RSI pullback, EMA200/ADX/volume filters)
+#   "squeeze_breakout" : volatility squeeze (Bollinger Bands inside Keltner
+#                        Channel) releasing with momentum + volume - catches the
+#                        start of a move after a quiet period
+#   "bb_reversion"     : range-market mean reversion - price stretched outside
+#                        the Bollinger Band with extreme RSI snaps back inside;
+#                        only when ADX shows NO trend
+# Compare them on real data first:  python backtest.py --compare-strategies
+STRATEGIES = ["trend_pullback", "squeeze_breakout", "bb_reversion"]
 
 # ---------------------------------------------------------------------------
 # Strategy / indicators
@@ -128,6 +149,29 @@ ADX_MIN = 20                    # Skip choppy, trendless markets (ADX < 20). 0 =
 VOLUME_SMA_PERIOD = 20
 VOLUME_MIN_RATIO = 1.0          # Signal bar volume >= 1.0 x 20-bar average. 0 = off
 REQUIRE_CONFIRM_CANDLE = True   # LONG needs a green signal bar, SHORT a red one
+# The filters above apply to "trend_pullback". The other strategies have
+# their own rules below (EMA200 trend direction is also used by the squeeze).
+
+# Bollinger Bands / Keltner Channel (shared by squeeze_breakout + bb_reversion)
+BB_PERIOD = 20
+BB_STD = 2.0
+KC_PERIOD = 20
+KC_ATR_MULT = 1.5
+
+# squeeze_breakout
+SQZ_MIN_BARS = 6                # Squeeze must have lasted >= 6 bars ...
+SQZ_LOOKBACK = 3                # ... and released within the last 3 bars
+SQZ_VOLUME_RATIO = 1.2          # Breakout bar volume >= 1.2 x 20-bar average
+SQZ_USE_TREND_FILTER = True     # Only break out in the EMA200 direction
+SQZ_SL_ATR = 1.5                # Stop = 1.5 x ATR
+SQZ_RR = 2.0                    # Target = 2 x stop
+
+# bb_reversion
+BBR_ADX_MAX = 20                # Only trade ranges: ADX below this
+BBR_RSI_LONG = 30               # Previous bar closed below the lower band with RSI < 30
+BBR_RSI_SHORT = 70              # ... or above the upper band with RSI > 70
+BBR_SL_ATR_BUFFER = 0.5         # Stop = swing extreme -/+ 0.5 x ATR
+BBR_MIN_RR = 1.2                # Target is the middle band; skip if reward < 1.2 x risk
 
 SL_ATR_MULTIPLIER = 1.5         # Stop distance = 1.5 x ATR
 RR_RATIO = 2.0                  # Take-profit distance = RR x stop distance
@@ -155,6 +199,17 @@ MIN_TP_COST_MULTIPLE = 2.0
 # Loop / UI
 # ---------------------------------------------------------------------------
 LOOP_INTERVAL = 10              # Seconds between bot iterations
+# The loop also wakes up this many seconds after every candle close, so
+# signals are evaluated right away instead of up to LOOP_INTERVAL later.
+CANDLE_CLOSE_DELAY = 2.0
+
+# Real-time price stream (ccxt WebSocket). Every tick is checked against
+# SL / TP / break-even / liquidation instead of once per LOOP_INTERVAL, so
+# stops fill near the stop price. The REST ticker check in the main loop
+# keeps running as a backup if the stream disconnects.
+USE_WEBSOCKET = True
+WS_RECONNECT_SECONDS = 5        # Wait before reconnecting after a stream error
+WS_STALE_SECONDS = 30           # Dashboard shows the stream as stale after this
 MAX_BACKOFF_SECONDS = 60        # Cap for exponential back-off on errors
 REQUEST_TIMEOUT_MS = 10000      # ccxt HTTP timeout
 UI_REFRESH_MS = 2500            # Dashboard auto-refresh interval

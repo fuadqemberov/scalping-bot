@@ -22,6 +22,8 @@ Usage:
     python backtest.py                      # current config.py settings, 14 days
     python backtest.py --days 30
     python backtest.py --compare            # current vs. previous (10x, no filters) vs. old 1m
+    python backtest.py --compare-strategies # each strategy alone, then all together
+    python backtest.py --strategies squeeze_breakout bb_reversion
     python backtest.py --set LEVERAGE=15 ADX_MIN=25 BREAKEVEN_TRIGGER_R=0
 """
 
@@ -55,8 +57,11 @@ class Params:
         return self.overrides.get(key, getattr(config, key))
 
 
+# Bars passed to evaluate_signal (strategies look back up to ~12 bars)
+SIGNAL_WINDOW = 40
+
 # Settings before this change (5m, 10x, no loss cap / break-even / filters)
-PREVIOUS = dict(LEVERAGE=10.0, MAX_LOSS_PER_TRADE=0.0, BREAKEVEN_TRIGGER_R=0.0,
+PREVIOUS = dict(STRATEGIES=["trend_pullback"], LEVERAGE=10.0, MAX_LOSS_PER_TRADE=0.0, BREAKEVEN_TRIGGER_R=0.0,
                 EMA_TREND=0, ADX_MIN=0, VOLUME_MIN_RATIO=0.0, REQUIRE_CONFIRM_CANDLE=False)
 # The original 1m settings from the first trade log
 LEGACY = dict(PREVIOUS, TIMEFRAME="1m", RR_RATIO=1.5, MIN_TP_COST_MULTIPLE=0.0,
@@ -179,7 +184,7 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             i = idx_of[sym].get(ts)
             if i is None or i < lookback + 2:
                 continue
-            diag = strategy.evaluate_signal(f.iloc[i - lookback - 1:i + 1])
+            diag = strategy.evaluate_signal(f.iloc[max(0, i - SIGNAL_WINDOW):i + 1])
             signal = diag["signal"]
             if not signal:
                 if diag.get("filters_failed"):
@@ -205,9 +210,9 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
                 skip("same-side limit")
                 continue
             try:
-                sl, tp = strategy.calculate_sl_tp(signal, price, float(f["ATR"].iloc[i]),
-                                                  config.SL_ATR_MULTIPLIER, config.RR_RATIO)
+                sl, tp = strategy.sl_tp_for_signal(diag, signal, price, float(f["ATR"].iloc[i]))
             except ValueError:
+                skip("invalid SL/TP")
                 continue
             ok, _ = strategy.check_trade_costs(price, tp, config.MIN_TP_COST_MULTIPLE)
             if not ok:
@@ -218,7 +223,8 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             if qty <= 0:
                 skip(why.split(" ")[0] + " size")
                 continue
-            if engine.open_position(signal, price, qty, sl, tp, symbol=sym, leverage=lev):
+            if engine.open_position(signal, price, qty, sl, tp, symbol=sym, leverage=lev,
+                                    strategy=diag.get("strategy")):
                 entered_at[sym] = i
 
     # Close leftovers at the last price so PnL is complete
@@ -233,7 +239,7 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
 # ---------------------------------------------------------------------------
 def report(res: Result) -> None:
     p, t = res.params, pd.DataFrame(res.trades)
-    keys = ["TIMEFRAME", "LEVERAGE", "RR_RATIO", "MAX_LOSS_PER_TRADE", "BREAKEVEN_TRIGGER_R",
+    keys = ["STRATEGIES", "TIMEFRAME", "LEVERAGE", "RR_RATIO", "MAX_LOSS_PER_TRADE", "BREAKEVEN_TRIGGER_R",
             "EMA_TREND", "ADX_MIN", "VOLUME_MIN_RATIO", "REQUIRE_CONFIRM_CANDLE"]
     print(f"\n=== {p.name}: " + ", ".join(f"{k}={p.get(k)}" for k in keys) + " ===")
     if t.empty:
@@ -256,6 +262,10 @@ def report(res: Result) -> None:
           f"({t.net_pnl.sum() / config.INITIAL_BALANCE * 100:+.2f}%) | max drawdown "
           f"{((peak - eq) / peak).max() * 100:.2f}%")
     print(t.groupby("symbol").net_pnl.agg(trades="count", net="sum").round(2).to_string())
+    if "strategy" in t and t["strategy"].nunique() > 1:
+        by = t.groupby("strategy").net_pnl
+        print(pd.DataFrame({"trades": by.count(), "win %": by.apply(lambda x: (x > 0).mean() * 100),
+                            "net": by.sum()}).round(2).to_string())
     print(t.exit_reason.value_counts().to_string())
     if res.skipped:
         print("Signals skipped:", ", ".join(f"{k} {v}" for k, v in sorted(res.skipped.items())))
@@ -281,12 +291,22 @@ def main() -> None:
     ap.add_argument("--symbols", nargs="*", default=config.SYMBOLS)
     ap.add_argument("--set", nargs="*", default=[], metavar="NAME=VALUE",
                     help="override config.py values for the main run, e.g. LEVERAGE=15")
+    ap.add_argument("--strategies", nargs="*", help="strategies for the main run (default: config.STRATEGIES)")
+    ap.add_argument("--compare-strategies", action="store_true",
+                    help="run every strategy on its own, then all of them together")
     ap.add_argument("--compare", action="store_true",
                     help="also run the previous settings (10x, no filters) and the old 1m settings")
     ap.add_argument("--csv", help="write the trades of the main run to this CSV file")
     args = ap.parse_args()
 
-    runs = [Params("current", parse_sets(args.set))]
+    main_over = parse_sets(args.set)
+    if args.strategies:
+        main_over["STRATEGIES"] = list(args.strategies)
+    runs = [Params("current", main_over)]
+    if args.compare_strategies:
+        runs = [Params(f"only {name}", dict(main_over, STRATEGIES=[name]))
+                for name in strategy.STRATEGY_FUNCS] + [Params("all strategies", dict(
+                    main_over, STRATEGIES=list(strategy.STRATEGY_FUNCS)))]
     if args.compare:
         runs += [Params("previous (10x, no filters)", dict(PREVIOUS)), Params("old 1m", dict(LEGACY))]
 

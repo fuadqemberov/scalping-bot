@@ -9,8 +9,15 @@ Indicators
     VWAP  : cumulative(typical_price * volume) / cumulative(volume),
             optionally reset at each UTC day (intraday session VWAP).
 
-Signals (evaluated on the most recent row of the frame passed in, which the
-bot guarantees is a *closed* candle) - "buy the pullback in an uptrend":
+Strategies (config.STRATEGIES, first one to fire wins):
+    trend_pullback   : described below
+    squeeze_breakout : Bollinger Bands inside Keltner Channel for >= N bars,
+                       then release with momentum + volume (+ EMA200 direction)
+    bb_reversion     : ADX < 20 range; prior bar outside a band with extreme
+                       RSI, signal bar closes back inside -> target middle band
+
+trend_pullback (evaluated on the most recent row of the frame passed in,
+which the bot guarantees is a *closed* candle) - "buy the pullback in an uptrend":
     LONG  : close > VWAP, EMA_fast > EMA_slow, RSI was < RSI_PULLBACK_LONG
             within the previous RSI_LOOKBACK bars and is now above it and rising.
     SHORT : close < VWAP, EMA_fast < EMA_slow, RSI was > RSI_PULLBACK_SHORT
@@ -123,6 +130,28 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return wilder(dx, period)
 
 
+def linreg_endpoint(series: pd.Series, period: int) -> pd.Series:
+    """Rolling least-squares line fitted over `period` bars, value at the last bar."""
+    x = np.arange(period, dtype=float)
+    xc = x - x.mean()
+    denom = float((xc ** 2).sum())
+
+    def _fit(y: np.ndarray) -> float:
+        ym = y.mean()
+        return ym + float(np.dot(xc, y - ym)) / denom * xc[-1]
+
+    return series.rolling(period, min_periods=period).apply(_fit, raw=True)
+
+
+def squeeze_momentum(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """TTM-squeeze style momentum: close vs. the mid of the recent range,
+    smoothed with a linear regression. > 0 and rising = bullish pressure."""
+    hh = df["high"].rolling(period, min_periods=period).max()
+    ll = df["low"].rolling(period, min_periods=period).min()
+    sma = df["close"].rolling(period, min_periods=period).mean()
+    return linreg_endpoint(df["close"] - ((hh + ll) / 2.0 + sma) / 2.0, period)
+
+
 def vwap(df: pd.DataFrame, reset_daily: bool = config.VWAP_RESET_DAILY) -> pd.Series:
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = typical * df["volume"]
@@ -172,6 +201,20 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Average of the bars BEFORE the signal bar, so the signal bar is compared to its past
     out["VOL_SMA"] = out["volume"].shift(1).rolling(vol_n, min_periods=vol_n).mean()
 
+    # Bollinger Bands, Keltner Channel, squeeze state and momentum
+    bb_n, kc_n = getattr(config, "BB_PERIOD", 20), getattr(config, "KC_PERIOD", 20)
+    mid = out["close"].rolling(bb_n, min_periods=bb_n).mean()
+    sd = out["close"].rolling(bb_n, min_periods=bb_n).std(ddof=0)
+    out["BB_MID"] = mid
+    out["BB_UP"] = mid + getattr(config, "BB_STD", 2.0) * sd
+    out["BB_LO"] = mid - getattr(config, "BB_STD", 2.0) * sd
+    kc_mid = ema(out["close"], kc_n)
+    kc_w = getattr(config, "KC_ATR_MULT", 1.5) * atr(out["high"], out["low"], out["close"], kc_n)
+    out["KC_UP"] = kc_mid + kc_w
+    out["KC_LO"] = kc_mid - kc_w
+    out["SQZ_ON"] = (out["BB_UP"] < out["KC_UP"]) & (out["BB_LO"] > out["KC_LO"])
+    out["MOM"] = squeeze_momentum(out, bb_n)
+
     # Human-readable names (e.g. EMA9, EMA21, RSI14, ATR14)
     out[f"EMA{config.EMA_FAST}"] = out["EMA_FAST"]
     out[f"EMA{config.EMA_SLOW}"] = out["EMA_SLOW"]
@@ -183,8 +226,152 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
-def evaluate_signal(df: pd.DataFrame) -> Dict[str, Any]:
-    """Evaluate the entry rules on the last row and explain the outcome.
+def evaluate_signal(df: pd.DataFrame, strategies: Optional[list] = None) -> Dict[str, Any]:
+    """Run the enabled strategies (config.STRATEGIES) on the last closed bar.
+
+    The first strategy that fires wins. The returned dict always has
+    ``signal`` ("LONG"/"SHORT"/None), ``strategy``, ``reason``, ``trend`` and
+    ``rsi`` (for logs and the dashboard); a fired signal may also carry
+    ``sl``/``tp`` prices (relative to ``close``) or ``sl_mult``/``rr``.
+    """
+    names = list(strategies or getattr(config, "STRATEGIES", None) or ["trend_pullback"])
+    reasons, filters_failed, base = [], [], None
+    for name in names:
+        fn = STRATEGY_FUNCS.get(name)
+        if fn is None:
+            reasons.append(f"{name}: unknown strategy")
+            continue
+        try:
+            res = fn(df)
+        except Exception as exc:  # one broken strategy must not stop the others
+            res = {"signal": None, "reason": f"error {type(exc).__name__}: {exc}"}
+        res["strategy"] = name
+        if name == "trend_pullback":
+            base = res
+        if res.get("signal"):
+            if base is None and "trend_pullback" in STRATEGY_FUNCS:
+                base = trend_pullback(df)
+            res.setdefault("trend", base.get("trend"))
+            res.setdefault("rsi", base.get("rsi"))
+            res["reason"] = f"[{name}] {res.get('reason', '')}"
+            return res
+        reasons.append(f"{name}: {res.get('reason', '')}")
+        filters_failed += res.get("filters_failed") or []
+    if base is None:
+        base = trend_pullback(df)
+    return {"signal": None, "strategy": None, "trend": base.get("trend"), "rsi": base.get("rsi"),
+            "reason": " | ".join(reasons), "filters_failed": filters_failed}
+
+
+def _last_rows_ok(df: pd.DataFrame, cols: list, n: int) -> Optional[str]:
+    if df is None or len(df) < n:
+        return "not enough bars"
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        return f"indicators missing {missing}"
+    if df[cols].iloc[-n:].isna().any().any():
+        return "indicators warming up"
+    return None
+
+
+def squeeze_breakout(df: pd.DataFrame) -> Dict[str, Any]:
+    """Volatility squeeze release with momentum, volume and trend confirmation.
+
+    Squeeze = Bollinger Bands inside the Keltner Channel (volatility is
+    compressed). When the bands expand back outside after >= SQZ_MIN_BARS,
+    a move usually starts; trade it in the direction of the momentum.
+    """
+    min_bars, look = config.SQZ_MIN_BARS, config.SQZ_LOOKBACK
+    n = min_bars + look + 2
+    cols = ["close", "BB_MID", "SQZ_ON", "MOM", "VOL_SMA", "ATR"]
+    bad = _last_rows_ok(df, cols, n)
+    if bad:
+        return {"signal": None, "reason": bad}
+    tail = df.iloc[-n:]
+    s = tail["SQZ_ON"].to_numpy(dtype=bool)
+    last, prev = tail.iloc[-1], tail.iloc[-2]
+    if s[-1]:
+        run = int(np.argmax(~s[::-1])) if (~s).any() else len(s)
+        return {"signal": None, "reason": f"squeeze on for {run} bars, waiting for release"}
+
+    released = False
+    for j in range(len(s) - 1, len(s) - 1 - look, -1):
+        if not s[j] and s[j - 1]:
+            run = 0
+            k = j - 1
+            while k >= 0 and s[k]:
+                run, k = run + 1, k - 1
+            released = run >= min_bars
+            if not released:
+                return {"signal": None, "reason": f"squeeze released after only {run} bars (< {min_bars})"}
+            break
+    if not released:
+        return {"signal": None, "reason": "no recent squeeze release"}
+
+    mom, mom_prev = float(last["MOM"]), float(prev["MOM"])
+    if mom > 0 and mom > mom_prev and last["close"] > last["BB_MID"]:
+        side = "LONG"
+    elif mom < 0 and mom < mom_prev and last["close"] < last["BB_MID"]:
+        side = "SHORT"
+    else:
+        return {"signal": None, "reason": f"squeeze released but momentum unclear ({mom_prev:.4g} -> {mom:.4g})"}
+
+    failed = []
+    if last["volume"] < config.SQZ_VOLUME_RATIO * last["VOL_SMA"]:
+        failed.append(f"volume {last['volume'] / last['VOL_SMA']:.2f}x avg < {config.SQZ_VOLUME_RATIO:g}x")
+    if config.SQZ_USE_TREND_FILTER and getattr(config, "EMA_TREND", 0) > 0:
+        t = last.get("EMA_TREND")
+        d = 1 if side == "LONG" else -1
+        if t is None or pd.isna(t):
+            failed.append(f"EMA{config.EMA_TREND} warming up")
+        elif (last["close"] - t) * d <= 0:
+            failed.append(f"against EMA{config.EMA_TREND} trend")
+    if failed:
+        return {"signal": None, "reason": f"{side} breakout filtered out: {'; '.join(failed)}",
+                "filters_failed": failed}
+    return {"signal": side, "sl_mult": config.SQZ_SL_ATR, "rr": config.SQZ_RR,
+            "reason": f"squeeze release, momentum {mom_prev:.4g} -> {mom:.4g}, "
+                      f"volume {last['volume'] / last['VOL_SMA']:.1f}x"}
+
+
+def bb_reversion(df: pd.DataFrame) -> Dict[str, Any]:
+    """Range-market mean reversion back into the Bollinger Bands.
+
+    Previous bar closed outside a band with an extreme RSI, the signal bar
+    closes back inside in the opposite colour, and ADX says there is no
+    trend. Target = middle band, stop = beyond the swing extreme.
+    """
+    cols = ["open", "high", "low", "close", "BB_UP", "BB_LO", "BB_MID", "RSI", "ADX", "ATR"]
+    bad = _last_rows_ok(df, cols, 2)
+    if bad:
+        return {"signal": None, "reason": bad}
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if last["ADX"] >= config.BBR_ADX_MAX:
+        return {"signal": None, "reason": f"ADX {last['ADX']:.1f} >= {config.BBR_ADX_MAX} (trending, no fade)"}
+
+    close, buf = float(last["close"]), config.BBR_SL_ATR_BUFFER * float(last["ATR"])
+    if (prev["close"] < prev["BB_LO"] and prev["RSI"] < config.BBR_RSI_LONG
+            and close > last["BB_LO"] and close > last["open"]):
+        side, tp = "LONG", float(last["BB_MID"])
+        sl = min(float(prev["low"]), float(last["low"])) - buf
+    elif (prev["close"] > prev["BB_UP"] and prev["RSI"] > config.BBR_RSI_SHORT
+            and close < last["BB_UP"] and close < last["open"]):
+        side, tp = "SHORT", float(last["BB_MID"])
+        sl = max(float(prev["high"]), float(last["high"])) + buf
+    else:
+        return {"signal": None, "reason": f"range (ADX {last['ADX']:.1f}), no band re-entry"}
+
+    risk, reward = abs(close - sl), (tp - close) * (1 if side == "LONG" else -1)
+    if reward <= 0 or reward < config.BBR_MIN_RR * risk:
+        return {"signal": None, "reason": f"{side} fade skipped: reward {reward:.4g} < "
+                                          f"{config.BBR_MIN_RR:g} x risk {risk:.4g}",
+                "filters_failed": ["reward/risk"]}
+    return {"signal": side, "sl": sl, "tp": tp, "close": close,
+            "reason": f"band re-entry, RSI {prev['RSI']:.1f}, ADX {last['ADX']:.1f}, RR {reward / risk:.2f}"}
+
+
+def trend_pullback(df: pd.DataFrame) -> Dict[str, Any]:
+    """Pullback in a trend: EMA9/21 + VWAP trend, RSI dip/spike and turn.
 
     Returns a dict with ``signal`` ("LONG", "SHORT" or None), ``trend``
     ("UP", "DOWN" or "MIXED"), the RSI values involved and a short
@@ -253,7 +440,37 @@ def evaluate_signal(df: pd.DataFrame) -> Dict[str, Any]:
         if failed:
             result["reason"] = f"{result['signal']} filtered out: {'; '.join(failed)}"
             result["signal"] = None
+        else:
+            result["sl_mult"] = config.SL_ATR_MULTIPLIER
+            result["rr"] = config.RR_RATIO
     return result
+
+
+STRATEGY_FUNCS = {
+    "trend_pullback": trend_pullback,
+    "squeeze_breakout": squeeze_breakout,
+    "bb_reversion": bb_reversion,
+}
+
+
+def sl_tp_for_signal(diag: Dict[str, Any], side: str, entry_price: float,
+                     atr_value: float) -> Tuple[float, float]:
+    """Stop / target for a fired signal.
+
+    Strategies that set explicit ``sl``/``tp`` prices (measured from the
+    signal bar's ``close``) keep those distances from the actual entry price;
+    the others use ATR multiples (``sl_mult`` x ATR, ``rr`` x stop).
+    """
+    if diag.get("sl") is not None and diag.get("tp") is not None:
+        shift = entry_price - float(diag.get("close", entry_price))
+        sl, tp = float(diag["sl"]) + shift, float(diag["tp"]) + shift
+        ok = (sl < entry_price < tp) if side == "LONG" else (tp < entry_price < sl)
+        if not ok:
+            raise ValueError(f"invalid {side} levels sl={sl:.6g} entry={entry_price:.6g} tp={tp:.6g}")
+        return sl, tp
+    return calculate_sl_tp(side, entry_price, atr_value,
+                           diag.get("sl_mult") or config.SL_ATR_MULTIPLIER,
+                           diag.get("rr") or config.RR_RATIO)
 
 
 def confirmation_failures(row: pd.Series, side: str) -> list:

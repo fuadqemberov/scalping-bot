@@ -34,6 +34,7 @@ import pandas as pd
 import config
 import strategy
 from paper_engine import PaperEngine
+from price_stream import PriceStream
 from risk_manager import RiskManager
 
 logger = logging.getLogger("bot")
@@ -147,6 +148,7 @@ class SharedState:
             "positions": {},            # symbol -> position dict
             "stats": None,
             "trade_history": [],
+            "stream": {"enabled": False},  # WebSocket price stream status
         }
         self._logs: Deque[str] = collections.deque(maxlen=config.LOG_BUFFER_SIZE)
 
@@ -223,6 +225,7 @@ class BotWorker:
         self._last_processed_candle_ts: Dict[str, pd.Timestamp] = {}
         self._last_prices: Dict[str, float] = {}
         self._cooldown_until: Dict[str, datetime] = {}   # symbol -> no entries before this time
+        self.stream: Optional[PriceStream] = None
         self._consecutive_errors = 0
 
     # ------------------------------------------------------------------
@@ -239,6 +242,7 @@ class BotWorker:
 
     def stop(self, timeout: float = 15.0) -> None:
         self._stop_event.set()
+        self._stop_stream()
         if self._thread:
             self._thread.join(timeout=timeout)
         self.state.update(status=STATUS_STOPPED)
@@ -325,6 +329,7 @@ class BotWorker:
                     logger.warning("Primary exchange '%s' unavailable - using fallback '%s'",
                                    config.EXCHANGE, ex_id)
                 logger.info("Connected to %s public API (%s, %s)", ex_id, ", ".join(available), config.TIMEFRAME)
+                self._start_stream(ex_id)
                 return True
             except AttributeError:
                 logger.error("Unknown ccxt exchange id '%s'", ex_id)
@@ -427,8 +432,53 @@ class BotWorker:
                             config.MAX_BACKOFF_SECONDS)
             else:
                 delay = max(0.0, config.LOOP_INTERVAL - (time.monotonic() - started))
+                delay = min(delay, self._seconds_to_candle_close())
             self._stop_event.wait(delay)
         logger.info("Autonomous loop exited")
+
+    @staticmethod
+    def _seconds_to_candle_close() -> float:
+        """Seconds until the current candle closes (+ CANDLE_CLOSE_DELAY)."""
+        tf = ccxt.Exchange.parse_timeframe(config.TIMEFRAME)
+        now = time.time()
+        next_close = (int(now // tf) + 1) * tf
+        return max(0.5, next_close - now + getattr(config, "CANDLE_CLOSE_DELAY", 2.0))
+
+    # ------------------------------------------------------------------
+    # WebSocket price stream
+    # ------------------------------------------------------------------
+    def _start_stream(self, ex_id: str) -> None:
+        if not getattr(config, "USE_WEBSOCKET", False):
+            return
+        if self.stream and self.stream.is_alive() and self.stream.exchange_id == ex_id \
+                and self.stream.symbols == self.symbols:
+            return
+        self._stop_stream()
+        self.stream = PriceStream(ex_id, self.symbols, self._on_tick)
+        if not self.stream.start():
+            self.stream = None
+
+    def _stop_stream(self) -> None:
+        if self.stream:
+            self.stream.stop()
+            self.stream = None
+
+    def _stream_price(self, sym: str) -> Optional[float]:
+        return self.stream.latest(sym, max_age=5.0) if self.stream else None
+
+    def _on_tick(self, sym: str, price: float) -> None:
+        """Called from the stream thread for every ticker update."""
+        self._last_prices[sym] = price
+        self.state.update_market(sym, last_price=price, last_price_time=datetime.now(timezone.utc))
+        if not self.engine.has_position(sym):
+            return
+        with self._trade_lock:
+            closed = self.engine.check_sl_tp(price, sym)
+        if closed:
+            logger.info("%s exit by %s (real-time): net PnL %.4f USDT",
+                        sym, closed["exit_reason"], closed["net_pnl"])
+            self._start_cooldown_if_stopped(sym, closed)
+            self._publish_account()
 
     def _handle_error(self, msg: str) -> None:
         self._consecutive_errors += 1
@@ -515,12 +565,13 @@ class BotWorker:
         self.state.update_market(sym, diagnostics=diag)
         if signal:
             now = datetime.now(timezone.utc)
-            logger.info("Signal %s %s on candle %s (close %.6g, RSI %.1f) - %s", signal, sym,
-                        candle_ts.strftime("%H:%M"), closed_df["close"].iloc[-1], diag["rsi"], diag["reason"])
+            rsi_txt = f"{diag['rsi']:.1f}" if diag.get("rsi") is not None else "n/a"
+            logger.info("Signal %s %s on candle %s (close %.6g, RSI %s) - %s", signal, sym,
+                        candle_ts.strftime("%H:%M"), closed_df["close"].iloc[-1], rsi_txt, diag["reason"])
             self.state.update_market(sym, last_signal=signal, last_signal_time=now)
             self.state.update(last_signal=signal, last_signal_symbol=sym, last_signal_time=now)
         elif getattr(config, "LOG_SIGNAL_DIAGNOSTICS", False):
-            rsi_txt = f"{diag['rsi']:.1f}" if diag["rsi"] is not None else "n/a"
+            rsi_txt = f"{diag['rsi']:.1f}" if diag.get("rsi") is not None else "n/a"
             logger.info("%s %s no signal | RSI %s | %s", sym, candle_ts.strftime("%H:%M"), rsi_txt, diag["reason"])
 
         with self._trade_lock:
@@ -551,11 +602,15 @@ class BotWorker:
                     logger.info("Signal %s %s ignored - already %d %s position(s) open (correlated coins)",
                                 signal, sym, self._same_side_count(signal), signal)
                 else:
-                    self._enter(sym, signal, price, float(closed_df["ATR"].iloc[-1]))
+                    # Freshest price: the WebSocket tick if the stream is live
+                    entry_px = self._stream_price(sym) or price
+                    self._enter(sym, signal, entry_px, float(closed_df["ATR"].iloc[-1]), diag)
 
-    def _enter(self, sym: str, side: str, price: float, atr_value: float) -> None:
+    def _enter(self, sym: str, side: str, price: float, atr_value: float,
+               diag: Optional[Dict[str, Any]] = None) -> None:
+        diag = diag or {}
         try:
-            sl, tp = strategy.calculate_sl_tp(side, price, atr_value)
+            sl, tp = strategy.sl_tp_for_signal(diag, side, price, atr_value)
         except ValueError as exc:
             logger.warning("%s entry skipped: %s", sym, exc)
             return
@@ -574,7 +629,8 @@ class BotWorker:
             logger.info("%s entry skipped: %s", sym, why)
             return
 
-        self.engine.open_position(side, price, qty, sl, tp, symbol=sym, leverage=leverage)
+        self.engine.open_position(side, price, qty, sl, tp, symbol=sym, leverage=leverage,
+                                  strategy=diag.get("strategy"))
 
     # ------------------------------------------------------------------
     # Entry filters
@@ -632,7 +688,9 @@ class BotWorker:
             status = STATUS_PAUSED
         else:
             status = STATUS_RUNNING
-        self.state.update(status=status, paused=self._paused.is_set(), resume_time=self.risk.resume_time)
+        stream = self.stream.status() if self.stream else {"enabled": False}
+        self.state.update(status=status, paused=self._paused.is_set(), resume_time=self.risk.resume_time,
+                          stream=stream)
 
 
 # ---------------------------------------------------------------------------

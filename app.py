@@ -79,6 +79,16 @@ def fmt_duration(seconds: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
 
+def stream_txt(stream: dict) -> str:
+    if not stream.get("enabled"):
+        return "REST polling every %ss" % config.LOOP_INTERVAL
+    if stream.get("connected"):
+        age = stream.get("last_tick_age")
+        return f"🟢 WebSocket live ({stream.get('ticks', 0)} ticks, last {age:.0f}s ago)"
+    err = stream.get("error") or "connecting"
+    return f"🟠 WebSocket down ({err}) — REST backup every {config.LOOP_INTERVAL}s"
+
+
 STATUS_COLORS = {
     "RUNNING": "#16a34a",
     "PAUSED": "#f59e0b",
@@ -124,7 +134,9 @@ with st.sidebar:
         f"**Scanning:** `{', '.join(symbols)}`  \n"
         f"**Exchange:** `{snap.get('exchange')}`  \n"
         f"**Timeframe:** `{snap.get('timeframe')}`  \n"
-        f"**Open positions:** {len(positions)} / {config.MAX_OPEN_POSITIONS}"
+        f"**Open positions:** {len(positions)} / {config.MAX_OPEN_POSITIONS}  \n"
+        f"**Strategies:** `{', '.join(config.STRATEGIES)}`  \n"
+        f"**Price feed:** {stream_txt(snap.get('stream') or {})}"
     )
 
     st.subheader("⚙️ Risk Parameters")
@@ -297,6 +309,7 @@ with chart_col:
             "Trend": d.get("trend") or "—",
             "RSI": round(d["rsi"], 1) if d.get("rsi") is not None else None,
             "Status": d.get("reason") or (m.get("error") or "waiting for data"),
+            "Strategy": d.get("strategy") or "",
             "Last signal": f"{m.get('last_signal')} {pd.Timestamp(m['last_signal_time']).strftime('%H:%M')}"
                            if m.get("last_signal") else "—",
             "Position": positions[sym]["side"] if sym in positions else "",
@@ -375,6 +388,7 @@ else:
         "Net PnL": hist["net_pnl"].round(4),
         "PnL %": hist["pnl_pct"].round(3),
         "Reason": hist["exit_reason"],
+        "Strategy": hist["strategy"] if "strategy" in hist else None,
         "Balance": hist["balance_after"].round(2),
     })
     st.dataframe(view, **STRETCH, height=320, hide_index=True)

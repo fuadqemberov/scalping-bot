@@ -140,6 +140,7 @@ class PaperEngine:
         tp: float,
         symbol: Optional[str] = None,
         leverage: Optional[float] = None,
+        strategy: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Open a market position with simulated slippage and entry fee.
 
@@ -218,6 +219,7 @@ class PaperEngine:
                 "initial_sl": sl,
                 "risk_dist": abs(fill - sl),   # 1R in price units
                 "breakeven_moved": False,
+                "strategy": strategy,
             }
             pos["unrealized_pnl"] = self._unrealized(pos, price)
             self.positions[symbol] = pos
@@ -225,8 +227,8 @@ class PaperEngine:
             self._update_drawdown_stats()
 
             logger.info(
-                "OPEN %s #%d %s qty=%g ref=%.6g fill=%.6g SL=%.6g TP=%.6g fee=%.4f%s",
-                side, pos["id"], symbol, qty, price, fill, sl, tp, fee,
+                "OPEN %s #%d %s [%s] qty=%g ref=%.6g fill=%.6g SL=%.6g TP=%.6g fee=%.4f%s",
+                side, pos["id"], symbol, strategy or "-", qty, price, fill, sl, tp, fee,
                 f" | {leverage:g}x margin={margin:.2f} notional={notional:.2f} liq={liq_price:.6g}"
                 if margin is not None else "",
             )
@@ -283,6 +285,7 @@ class PaperEngine:
                 "net_pnl": net,
                 "pnl_pct": (net / entry_notional * 100) if entry_notional else 0.0,
                 "exit_reason": reason,
+                "strategy": pos.get("strategy"),
                 "leverage": pos.get("leverage"),
                 "margin": pos.get("margin"),
                 "roe_pct": (net / pos["margin"] * 100) if pos.get("margin") else None,
