@@ -124,31 +124,39 @@ class RiskManager:
     ) -> Tuple[float, Optional[float], str]:
         """Size an order per config. Returns (qty, leverage or None, reason if qty == 0).
 
-        "margin" mode: fixed margin x LEVERAGE, then capped so a stop-out
-        loses at most MAX_LOSS_PER_TRADE of the balance (incl. costs), and
-        rejected if the stop sits beyond the liquidation price.
+        "margin" mode: leverage = highest value <= LEVERAGE that keeps the
+        liquidation price LIQ_BUFFER_MULT x the stop distance away; notional =
+        MARGIN_PER_TRADE x balance x leverage, capped so a stop-out (incl.
+        costs) loses at most MAX_LOSS_PER_TRADE of the balance.
         """
         if getattr(config, "POSITION_SIZING_MODE", "risk") != "margin":
             qty = self.calculate_position_size(equity, entry_price, sl_price, qty_step, min_qty)
             return qty, None, "" if qty > 0 else "position size is zero"
 
-        leverage = config.LEVERAGE
         stop_dist = abs(entry_price - sl_price)
-        liq_move = (1.0 / leverage - config.MAINTENANCE_MARGIN_RATE - self.max_slippage) * entry_price
-        if stop_dist >= liq_move:
-            return 0.0, leverage, (f"stop {stop_dist:.6g} is beyond the {leverage:g}x "
-                                   f"liquidation distance {liq_move:.6g}")
+        if stop_dist <= 0 or balance <= 0:
+            return 0.0, None, "invalid stop"
+        stop_frac = stop_dist / entry_price
+        cost_frac = 2 * (self.max_slippage + self.fee_rate)
 
-        qty = self.calculate_margin_size(balance, entry_price, used_margin=used_margin,
-                                         leverage=leverage, qty_step=qty_step, min_qty=min_qty)
+        # Highest leverage (<= LEVERAGE) whose liquidation price stays at least
+        # LIQ_BUFFER_MULT x the stop distance away (isolated margin model).
+        buf = getattr(config, "LIQ_BUFFER_MULT", 1.0)
+        lev_limit = 1.0 / (buf * stop_frac + config.MAINTENANCE_MARGIN_RATE + self.max_slippage)
+        leverage = float(min(config.LEVERAGE, math.floor(lev_limit)))
+        if leverage < 1:
+            return 0.0, None, f"stop {stop_frac * 100:.2f}% too wide for any leverage"
+
+        notional = balance * config.MARGIN_PER_TRADE * leverage
         max_loss = getattr(config, "MAX_LOSS_PER_TRADE", 0.0)
-        if qty > 0 and max_loss > 0 and stop_dist > 0:
-            cost_per_unit = 2 * entry_price * (self.max_slippage + self.fee_rate)
-            cap = balance * max_loss / (stop_dist + cost_per_unit)
-            if cap < qty:
-                logger.info("Size cut by MAX_LOSS_PER_TRADE %.2f%%: %.6g -> %.6g",
-                            max_loss * 100, qty, cap)
-                qty = self._round_qty(cap, qty_step, min_qty)
+        if max_loss > 0:
+            notional = min(notional, balance * max_loss / (stop_frac + cost_frac))
+        margin = notional / leverage
+        entry_fee = notional * (self.fee_rate + self.max_slippage)
+        if margin + entry_fee > balance - used_margin:
+            return 0.0, leverage, (f"not enough free balance for margin {margin:.2f} "
+                                   f"(free {balance - used_margin:.2f})")
+        qty = self._round_qty(notional / entry_price, qty_step, min_qty)
         return qty, leverage, "" if qty > 0 else "position size is zero"
 
     @staticmethod
@@ -168,6 +176,31 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Circuit breaker
     # ------------------------------------------------------------------
+    def daily_risk_budget_ok(self, engine, extra_risk_frac: float) -> Tuple[bool, str]:
+        """Would one more trade risking ``extra_risk_frac`` of the day-start equity
+        (plus the stop risk of open positions) still fit inside the daily limit?"""
+        try:
+            start = engine.day_start_equity or 0.0
+            if start <= 0:
+                return True, ""
+            dd = engine.get_daily_drawdown_pct()
+            open_risk = 0.0
+            with engine._lock:  # positions may be closed by the price-stream thread
+                positions = [dict(p) for p in engine.positions.values()]
+            for pos in positions:
+                d = 1 if pos["side"] == "LONG" else -1
+                # loss from the current price to the stop, plus the exit fee
+                loss = max(0.0, (pos["current_price"] - pos["sl"]) * d) * pos["qty"]
+                loss += pos["sl"] * pos["qty"] * (self.fee_rate + self.max_slippage)
+                open_risk += loss / start
+            total = dd + open_risk + extra_risk_frac
+            if total > self.daily_drawdown_limit:
+                return False, (f"daily risk budget: today {dd * 100:.2f}% + open {open_risk * 100:.2f}% "
+                               f"+ new {extra_risk_frac * 100:.2f}% > {self.daily_drawdown_limit * 100:.1f}%")
+        except Exception:
+            logger.exception("Daily risk budget check failed")
+        return True, ""
+
     def check_daily_drawdown(self, engine) -> bool:
         """True if today's equity loss reached the limit. Triggers a suspension."""
         try:
@@ -181,7 +214,11 @@ class RiskManager:
                 if self.suspended_until is None:
                     now = datetime.now(timezone.utc)
                     self.last_breach_time = now
-                    self.suspended_until = now + timedelta(hours=self.suspension_hours)
+                    if getattr(config, "SUSPEND_UNTIL_NEXT_UTC_DAY", False):
+                        self.suspended_until = datetime(now.year, now.month, now.day,
+                                                        tzinfo=timezone.utc) + timedelta(days=1)
+                    else:
+                        self.suspended_until = now + timedelta(hours=self.suspension_hours)
                     logger.warning(
                         "DAILY DRAWDOWN BREACH %.2f%% >= %.2f%% - trading suspended until %s UTC",
                         dd * 100, self.daily_drawdown_limit * 100,

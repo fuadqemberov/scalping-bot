@@ -283,7 +283,7 @@ def squeeze_breakout(df: pd.DataFrame) -> Dict[str, Any]:
     """
     min_bars, look = config.SQZ_MIN_BARS, config.SQZ_LOOKBACK
     n = min_bars + look + 2
-    cols = ["close", "BB_MID", "SQZ_ON", "MOM", "VOL_SMA", "ATR"]
+    cols = ["close", "BB_MID", "KC_UP", "KC_LO", "SQZ_ON", "MOM", "VOL_SMA", "ATR"]
     bad = _last_rows_ok(df, cols, n)
     if bad:
         return {"signal": None, "reason": bad}
@@ -309,12 +309,15 @@ def squeeze_breakout(df: pd.DataFrame) -> Dict[str, Any]:
         return {"signal": None, "reason": "no recent squeeze release"}
 
     mom, mom_prev = float(last["MOM"]), float(prev["MOM"])
-    if mom > 0 and mom > mom_prev and last["close"] > last["BB_MID"]:
+    # A real breakout closes outside the Keltner Channel in the momentum
+    # direction; closing just above the middle band (old rule) was mostly noise.
+    if mom > 0 and mom > mom_prev and last["close"] > last["KC_UP"]:
         side = "LONG"
-    elif mom < 0 and mom < mom_prev and last["close"] < last["BB_MID"]:
+    elif mom < 0 and mom < mom_prev and last["close"] < last["KC_LO"]:
         side = "SHORT"
     else:
-        return {"signal": None, "reason": f"squeeze released but momentum unclear ({mom_prev:.4g} -> {mom:.4g})"}
+        return {"signal": None, "reason": f"squeeze released but no close outside Keltner "
+                                          f"with momentum ({mom_prev:.4g} -> {mom:.4g})"}
 
     failed = []
     if last["volume"] < config.SQZ_VOLUME_RATIO * last["VOL_SMA"]:
@@ -453,6 +456,30 @@ STRATEGY_FUNCS = {
 }
 
 
+def entry_context(row: pd.Series, diag: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot of the market at the signal bar, stored with the trade for analysis."""
+    def num(key):
+        v = row.get(key)
+        return None if v is None or pd.isna(v) else float(v)
+    close = num("close") or 0.0
+    atr_v, vol, vol_avg = num("ATR"), num("volume"), num("VOL_SMA")
+    return {
+        "reason": diag.get("reason"),
+        "trend": diag.get("trend"),
+        "rsi": num("RSI"),
+        "adx": num("ADX"),
+        "atr_pct": atr_v / close * 100 if atr_v and close else None,
+        "vol_ratio": vol / vol_avg if vol and vol_avg else None,
+        "hour_utc": int(pd.Timestamp(row["timestamp"]).hour) if "timestamp" in row else None,
+    }
+
+
+def min_stop_distance(entry_price: float) -> float:
+    """Smallest allowed stop distance in price units (MIN_STOP_COST_MULTIPLE x costs)."""
+    mult = getattr(config, "MIN_STOP_COST_MULTIPLE", 0.0)
+    return entry_price * mult * round_trip_cost_pct() if mult > 0 else 0.0
+
+
 def sl_tp_for_signal(diag: Dict[str, Any], side: str, entry_price: float,
                      atr_value: float) -> Tuple[float, float]:
     """Stop / target for a fired signal.
@@ -460,17 +487,32 @@ def sl_tp_for_signal(diag: Dict[str, Any], side: str, entry_price: float,
     Strategies that set explicit ``sl``/``tp`` prices (measured from the
     signal bar's ``close``) keep those distances from the actual entry price;
     the others use ATR multiples (``sl_mult`` x ATR, ``rr`` x stop).
+    Stops tighter than ``min_stop_distance`` are widened: ATR targets move
+    out with them (same RR); a fixed target must still pay BBR_MIN_RR.
+    Raises ValueError when no valid trade remains.
     """
+    d = 1 if side == "LONG" else -1
+    min_dist = min_stop_distance(entry_price)
     if diag.get("sl") is not None and diag.get("tp") is not None:
         shift = entry_price - float(diag.get("close", entry_price))
         sl, tp = float(diag["sl"]) + shift, float(diag["tp"]) + shift
-        ok = (sl < entry_price < tp) if side == "LONG" else (tp < entry_price < sl)
-        if not ok:
-            raise ValueError(f"invalid {side} levels sl={sl:.6g} entry={entry_price:.6g} tp={tp:.6g}")
-        return sl, tp
-    return calculate_sl_tp(side, entry_price, atr_value,
-                           diag.get("sl_mult") or config.SL_ATR_MULTIPLIER,
-                           diag.get("rr") or config.RR_RATIO)
+        if abs(entry_price - sl) < min_dist:
+            sl = entry_price - d * min_dist
+        risk, reward = abs(entry_price - sl), (tp - entry_price) * d
+        need = getattr(config, "BBR_MIN_RR", 1.0)
+        if reward <= 0 or reward < need * risk:
+            raise ValueError(f"target {reward / entry_price * 100:.3f}% < {need:g} x widened stop "
+                             f"{risk / entry_price * 100:.3f}%")
+    else:
+        rr = diag.get("rr") or config.RR_RATIO
+        sl, tp = calculate_sl_tp(side, entry_price, atr_value,
+                                 diag.get("sl_mult") or config.SL_ATR_MULTIPLIER, rr)
+        if abs(entry_price - sl) < min_dist:
+            sl, tp = entry_price - d * min_dist, entry_price + d * rr * min_dist
+    ok = (sl < entry_price < tp) if side == "LONG" else (tp < entry_price < sl)
+    if not ok:
+        raise ValueError(f"invalid {side} levels sl={sl:.6g} entry={entry_price:.6g} tp={tp:.6g}")
+    return sl, tp
 
 
 def confirmation_failures(row: pd.Series, side: str) -> list:

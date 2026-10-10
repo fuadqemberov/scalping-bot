@@ -141,6 +141,7 @@ class PaperEngine:
         symbol: Optional[str] = None,
         leverage: Optional[float] = None,
         strategy: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Open a market position with simulated slippage and entry fee.
 
@@ -220,6 +221,9 @@ class PaperEngine:
                 "risk_dist": abs(fill - sl),   # 1R in price units
                 "breakeven_moved": False,
                 "strategy": strategy,
+                "context": dict(context or {}),   # signal snapshot for analysis
+                "best_price": fill,               # max favourable excursion (MFE)
+                "worst_price": fill,              # max adverse excursion (MAE)
             }
             pos["unrealized_pnl"] = self._unrealized(pos, price)
             self.positions[symbol] = pos
@@ -286,6 +290,8 @@ class PaperEngine:
                 "pnl_pct": (net / entry_notional * 100) if entry_notional else 0.0,
                 "exit_reason": reason,
                 "strategy": pos.get("strategy"),
+                **self._excursion_stats(pos),
+                **{f"ctx_{k}": v for k, v in (pos.get("context") or {}).items()},
                 "leverage": pos.get("leverage"),
                 "margin": pos.get("margin"),
                 "roe_pct": (net / pos["margin"] * 100) if pos.get("margin") else None,
@@ -312,7 +318,38 @@ class PaperEngine:
             if pos:
                 pos["current_price"] = price
                 pos["unrealized_pnl"] = self._unrealized(pos, price)
+                self._track_excursion(pos, price, price)
             self._update_drawdown_stats()
+
+    def record_excursion(self, high: float, low: float, symbol: Optional[str] = None) -> None:
+        """Feed a bar's high/low into MFE/MAE tracking (used by the backtester)."""
+        symbol = symbol or self.symbol
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if pos:
+                self._track_excursion(pos, high, low)
+
+    @staticmethod
+    def _track_excursion(pos: Dict[str, Any], high: float, low: float) -> None:
+        if pos["side"] == "LONG":
+            pos["best_price"] = max(pos.get("best_price", high), high)
+            pos["worst_price"] = min(pos.get("worst_price", low), low)
+        else:
+            pos["best_price"] = min(pos.get("best_price", low), low)
+            pos["worst_price"] = max(pos.get("worst_price", high), high)
+
+    def _excursion_stats(self, pos: Dict[str, Any]) -> Dict[str, Any]:
+        """MFE / MAE in % of entry and in R (multiples of the initial stop distance)."""
+        entry, d = pos["entry_price"], self._direction(pos["side"])
+        risk = pos.get("risk_dist") or 0.0
+        mfe = max(0.0, (pos.get("best_price", entry) - entry) * d)
+        mae = max(0.0, (entry - pos.get("worst_price", entry)) * d)
+        return {
+            "mfe_pct": mfe / entry * 100, "mae_pct": mae / entry * 100,
+            "mfe_r": mfe / risk if risk else None, "mae_r": mae / risk if risk else None,
+            "stop_pct": risk / entry * 100,
+            "target_pct": abs(pos["tp"] - entry) / entry * 100,
+        }
 
     def check_sl_tp(self, current_price: float, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Close the position if SL or TP has been touched.

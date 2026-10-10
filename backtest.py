@@ -40,6 +40,7 @@ from typing import Any, Dict, Iterator, List
 import ccxt
 import pandas as pd
 
+import analysis
 import config
 import strategy
 from paper_engine import PaperEngine
@@ -140,6 +141,7 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
 
     frames = {s: strategy.compute_indicators(df).set_index("timestamp", drop=False) for s, df in data.items()}
     entered_at: Dict[str, int] = {}       # symbol -> bar index of entry
+    entry_ts: Dict[str, Any] = {}         # symbol -> bar timestamp of entry
     cooldown_until: Dict[str, int] = {}   # symbol -> first bar index allowed
     clock = sorted(set().union(*[f.index for f in frames.values()]))
     idx_of = {s: {ts: i for i, ts in enumerate(f.index)} for s, f in frames.items()}
@@ -150,13 +152,24 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
     def close(sym: str, px: float, reason: str, ts) -> None:
         t = engine.close_position(px, reason, sym)
         if t:
+            # Simulated time, not wall-clock time (entry = signal bar close)
+            t["entry_time"] = entry_ts.pop(sym, ts)
+            t["exit_time"] = ts
+            t["duration_sec"] = (ts - t["entry_time"]).total_seconds()
             t["bar_time"] = ts
             res.trades.append(t)
             entered_at.pop(sym, None)
             if reason == "STOP_LOSS" and config.SL_COOLDOWN_BARS > 0:
                 cooldown_until[sym] = idx_of[sym][ts] + config.SL_COOLDOWN_BARS + 1
 
+    current_day, suspended_day = None, None
     for ts in clock:
+        # 0) UTC day roll: reset the daily drawdown reference like the live engine
+        day = ts.date()
+        if day != current_day:
+            current_day = day
+            engine.day_start_equity = engine.get_equity()
+
         # 1) exits inside this bar, then the break-even move
         for sym, f in frames.items():
             i = idx_of[sym].get(ts)
@@ -166,6 +179,7 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             if not pos or entered_at.get(sym) == i:
                 continue
             bar = f.loc[ts]
+            engine.record_excursion(bar["high"], bar["low"], sym)
             d = 1 if pos["side"] == "LONG" else -1
             stop_reason = "BREAKEVEN_STOP" if pos.get("breakeven_moved") else "STOP_LOSS"
             worst, best = (bar["low"], bar["high"]) if d > 0 else (bar["high"], bar["low"])
@@ -178,6 +192,17 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             else:
                 engine.update_market_price(bar["close"], sym)
                 engine.apply_breakeven(best, sym)
+
+        # 1b) daily drawdown breaker (mark open positions at this bar's close)
+        for sym, f in frames.items():
+            if engine.has_position(sym) and ts in idx_of[sym]:
+                engine.update_market_price(float(f.loc[ts, "close"]), sym)
+        if suspended_day != day and engine.get_daily_drawdown_pct() >= config.DAILY_DRAWDOWN_LIMIT:
+            for sym, f in frames.items():
+                if engine.has_position(sym):
+                    close(sym, float(f["close"].asof(ts)), "DRAWDOWN_BREAKER", ts)
+            suspended_day = day
+            skip("breaker day")
 
         # 2) signals on this closed bar
         for sym, f in frames.items():
@@ -199,6 +224,9 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
                     continue
             if pos:
                 continue
+            if suspended_day == day:
+                skip("suspended (breaker)")
+                continue
             if cooldown_until.get(sym, -1) > i:
                 skip("cooldown after SL")
                 continue
@@ -212,7 +240,7 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             try:
                 sl, tp = strategy.sl_tp_for_signal(diag, signal, price, float(f["ATR"].iloc[i]))
             except ValueError:
-                skip("invalid SL/TP")
+                skip("target < min stop")
                 continue
             ok, _ = strategy.check_trade_costs(price, tp, config.MIN_TP_COST_MULTIPLE)
             if not ok:
@@ -223,9 +251,18 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
             if qty <= 0:
                 skip(why.split(" ")[0] + " size")
                 continue
+            if getattr(config, "CHECK_DAILY_RISK_BUDGET", False):
+                risk_frac = qty * (abs(price - sl) + price * strategy.round_trip_cost_pct()) \
+                    / max(engine.day_start_equity, 1e-9)
+                ok, _ = risk.daily_risk_budget_ok(engine, risk_frac)
+                if not ok:
+                    skip("daily risk budget")
+                    continue
             if engine.open_position(signal, price, qty, sl, tp, symbol=sym, leverage=lev,
-                                    strategy=diag.get("strategy")):
+                                    strategy=diag.get("strategy"),
+                                    context=strategy.entry_context(f.iloc[i], diag)):
                 entered_at[sym] = i
+                entry_ts[sym] = ts
 
     # Close leftovers at the last price so PnL is complete
     for sym, f in frames.items():
@@ -239,34 +276,17 @@ def _run(params: Params, data: Dict[str, pd.DataFrame]) -> Result:
 # ---------------------------------------------------------------------------
 def report(res: Result) -> None:
     p, t = res.params, pd.DataFrame(res.trades)
-    keys = ["STRATEGIES", "TIMEFRAME", "LEVERAGE", "RR_RATIO", "MAX_LOSS_PER_TRADE", "BREAKEVEN_TRIGGER_R",
-            "EMA_TREND", "ADX_MIN", "VOLUME_MIN_RATIO", "REQUIRE_CONFIRM_CANDLE"]
+    keys = ["STRATEGIES", "TIMEFRAME", "LEVERAGE", "RR_RATIO", "MAX_LOSS_PER_TRADE",
+            "MIN_STOP_COST_MULTIPLE", "BREAKEVEN_TRIGGER_R", "EMA_TREND", "ADX_MIN"]
     print(f"\n=== {p.name}: " + ", ".join(f"{k}={p.get(k)}" for k in keys) + " ===")
     if t.empty:
         print("No trades.")
-        if res.skipped:
-            print("Signals skipped:", ", ".join(f"{k} {v}" for k, v in sorted(res.skipped.items())))
-        return
-    wins = t[t.net_pnl > 0]
-    losses = t[t.net_pnl <= 0]
-    eq = config.INITIAL_BALANCE + t.net_pnl.cumsum()
-    peak = eq.cummax().clip(lower=config.INITIAL_BALANCE)
-    loss_sum = losses.net_pnl.sum()
-    pf = wins.net_pnl.sum() / -loss_sum if loss_sum < 0 else float("inf")
-    print(f"Trades {len(t)} | win rate {len(wins) / len(t) * 100:.1f}% | profit factor {pf:.2f} | "
-          f"avg win {wins.net_pnl.mean() if len(wins) else 0:+.2f} | "
-          f"avg loss {losses.net_pnl.mean() if len(losses) else 0:+.2f} | "
-          f"worst {t.net_pnl.min():+.2f}")
-    print(f"Gross {t.gross_pnl.sum():+.2f} | fees {-t.total_fees.sum():.2f} | "
-          f"(slippage inside fills {t.slippage_cost.sum():.2f}) | NET {t.net_pnl.sum():+.2f} USDT "
-          f"({t.net_pnl.sum() / config.INITIAL_BALANCE * 100:+.2f}%) | max drawdown "
-          f"{((peak - eq) / peak).max() * 100:.2f}%")
-    print(t.groupby("symbol").net_pnl.agg(trades="count", net="sum").round(2).to_string())
-    if "strategy" in t and t["strategy"].nunique() > 1:
-        by = t.groupby("strategy").net_pnl
-        print(pd.DataFrame({"trades": by.count(), "win %": by.apply(lambda x: (x > 0).mean() * 100),
-                            "net": by.sum()}).round(2).to_string())
-    print(t.exit_reason.value_counts().to_string())
+    else:
+        eq = config.INITIAL_BALANCE + t.net_pnl.cumsum()
+        peak = eq.cummax().clip(lower=config.INITIAL_BALANCE)
+        print(f"Return {t.net_pnl.sum() / config.INITIAL_BALANCE * 100:+.2f}% | "
+              f"max drawdown {((peak - eq) / peak).max() * 100:.2f}%")
+        print(analysis.report_text(analysis.analyze(res.trades)))
     if res.skipped:
         print("Signals skipped:", ", ".join(f"{k} {v}" for k, v in sorted(res.skipped.items())))
 

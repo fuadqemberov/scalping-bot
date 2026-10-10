@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import analysis
 import config
 from bot_worker import BotWorker
 
@@ -142,8 +143,10 @@ with st.sidebar:
     st.subheader("⚙️ Risk Parameters")
     if config.POSITION_SIZING_MODE == "margin":
         sizing_txt = (
-            f"- Order size: **{config.MARGIN_PER_TRADE * 100:.0f}%** of balance as margin "
-            f"× **{config.LEVERAGE:g}x** = **{config.MARGIN_PER_TRADE * config.LEVERAGE * 100:.0f}%** notional\n"
+            f"- Leverage: up to **{config.LEVERAGE:g}x**, chosen per trade so liquidation is "
+            f"≥ **{config.LIQ_BUFFER_MULT:g}×** the stop away\n"
+            f"- Min stop: **{config.MIN_STOP_COST_MULTIPLE:g}×** round-trip costs "
+            f"(**{config.MIN_STOP_COST_MULTIPLE * 2 * (config.FEE_RATE + config.SLIPPAGE_MAX) * 100:.2f}%**)\n"
         )
     else:
         sizing_txt = (
@@ -153,7 +156,7 @@ with st.sidebar:
     st.markdown(
         sizing_txt
         + f"- Daily DD limit: **{config.DAILY_DRAWDOWN_LIMIT * 100:.1f}%** "
-        f"(halt {config.SUSPENSION_HOURS}h)\n"
+        f"(halt {'until next UTC day' if config.SUSPEND_UNTIL_NEXT_UTC_DAY else str(config.SUSPENSION_HOURS) + 'h'})\n"
         f"- SL: **{config.SL_ATR_MULTIPLIER} × ATR{config.ATR_PERIOD}**\n"
         f"- TP: **{config.RR_RATIO} R** (min **{config.MIN_TP_COST_MULTIPLE:g}×** round-trip costs)\n"
         f"- Max loss / trade: **{config.MAX_LOSS_PER_TRADE * 100:.2f}%** of balance · "
@@ -391,8 +394,70 @@ else:
         "Strategy": hist["strategy"] if "strategy" in hist else None,
         "Balance": hist["balance_after"].round(2),
     })
+
+    def _col(name, digits=2):
+        return hist[name].astype(float).round(digits) if name in hist else None
+
+    # Analysis columns (MFE/MAE, risk structure, signal context) - also in the CSV
+    view["Lev"] = _col("leverage", 0)
+    view["Stop %"] = _col("stop_pct", 3)
+    view["Target %"] = _col("target_pct", 3)
+    view["MFE R"] = _col("mfe_r")
+    view["MAE R"] = _col("mae_r")
+    view["Hour"] = hist["ctx_hour_utc"] if "ctx_hour_utc" in hist else None
+    view["ADX"] = _col("ctx_adx", 1)
+    view["ATR %"] = _col("ctx_atr_pct", 3)
+    view["Vol x"] = _col("ctx_vol_ratio")
+    view["Signal"] = hist["ctx_reason"] if "ctx_reason" in hist else None
     st.dataframe(view, **STRETCH, height=320, hide_index=True)
     st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode(), "trade_history.csv", "text/csv")
+
+    # -----------------------------------------------------------------------
+    # Performance analysis
+    # -----------------------------------------------------------------------
+    st.subheader("🔬 Performance Analysis")
+    res = analysis.analyze(trades)
+    a = res["summary"]
+    k = st.columns(6)
+    k[0].metric("Expectancy", f"{a['expectancy_r']:+.2f} R", f"{a['expectancy_usd']:+.2f} $ / trade")
+    k[1].metric("Profit factor", f"{a['profit_factor']:.2f}")
+    k[2].metric("Real RR (after costs)", f"{a['effective_rr']:.2f}")
+    k[3].metric("Break-even win rate", f"{a['breakeven_win_rate']:.0f}%",
+                f"actual {a['win_rate']:.0f}%",
+                delta_color="normal" if a["win_rate"] >= a["breakeven_win_rate"] else "inverse")
+    k[4].metric("Costs / losses", f"{a['cost_share_of_losses']:.0f}%")
+    k[5].metric("Max losing streak", a["max_loss_streak"])
+    for line in res["insights"]:
+        st.markdown(f"- {line}")
+
+    tabs = st.tabs([f"By {name}" for name in res["groups"]] + ["MFE / MAE"])
+    for tab, (name, g) in zip(tabs, res["groups"].items()):
+        with tab:
+            if g is None or g.empty:
+                st.caption("No data.")
+            else:
+                st.dataframe(g, **STRETCH)
+    with tabs[-1]:
+        adf = res["df"]
+        if "mfe_r" in adf and adf["mfe_r"].notna().any():
+            fig_x = go.Figure()
+            for won, color, label in ((True, "#16a34a", "winners"), (False, "#dc2626", "losers")):
+                part = adf[adf["win"] == won]
+                fig_x.add_trace(go.Scatter(
+                    x=part["mae_r"], y=part["mfe_r"], mode="markers", name=label,
+                    marker=dict(color=color, size=9),
+                    text=[f"{r.symbol} {r.side} {r.strategy} {r.net:+.2f}$" for r in part.itertuples()],
+                    hovertemplate="%{text}<br>MAE %{x:.2f}R · MFE %{y:.2f}R<extra></extra>"))
+            fig_x.add_hline(y=1, line=dict(dash="dot", color="#94a3b8"))
+            fig_x.add_vline(x=1, line=dict(dash="dot", color="#94a3b8"))
+            fig_x.update_layout(height=360, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10),
+                                xaxis_title="MAE: worst move against the trade (R)",
+                                yaxis_title="MFE: best move in favour (R)")
+            st.plotly_chart(fig_x, **STRETCH, key="mfe_mae")
+            st.caption("Red dots high up = losers that were in profit first (earlier break-even helps). "
+                       "Green dots far right = winners that nearly hit the stop (stop close to noise).")
+        else:
+            st.caption("MFE/MAE is recorded for trades opened with this version.")
 
 
 # ---------------------------------------------------------------------------

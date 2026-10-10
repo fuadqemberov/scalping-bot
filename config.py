@@ -62,27 +62,33 @@ FEE_RATE = 0.0005               # 0.05 % taker fee, charged on entry AND exit
 #   "risk"   : size so that a stop-out loses RISK_PER_TRADE of equity.
 POSITION_SIZING_MODE = "margin"
 MARGIN_PER_TRADE = 0.07         # 7 % of balance used as margin per order
-# 100x -> margin 7 % x 100 = up to 700 % of balance notional per position.
-# Leverage scales wins AND losses (and fees) by the same factor, so it is
-# paired with MAX_LOSS_PER_TRADE below, which shrinks the order so that one
-# stop-out still costs at most 1 % of the balance. At 100x the liquidation
-# price is only ~0.47 % away: any setup whose stop is farther than that is
-# skipped, and a fast wick can liquidate a position before its stop fills.
+# MAXIMUM leverage. The leverage actually used is chosen per trade: as high
+# as possible up to this value, but low enough that the liquidation price is
+# at least LIQ_BUFFER_MULT x the stop distance away. (A fixed 100x put the
+# liquidation 0.47 % away, which forced every stop to be tighter than that -
+# and such tight stops are eaten by fees: see MIN_STOP_COST_MULTIPLE.)
 # Note: real exchanges cap leverage per symbol (e.g. Binance: BTC 125x, many
 # altcoins 50-75x); this paper engine does not enforce those caps.
 LEVERAGE = 100.0
+LIQ_BUFFER_MULT = 2.0           # liquidation >= 2 x stop distance from entry
 # Hard cap: a stop-out (incl. worst-case fees + slippage) may lose at most
-# this fraction of the balance. At 100x this cap - not the leverage - sets
-# the position size (e.g. stop 0.37 % -> ~3,800 $ notional on 2,000 $).
+# this fraction of the balance. This - not the leverage - sets the position
+# size. 0.75 % lets the bot survive 4 stops before the 3 % daily breaker.
 # Set 0 to disable.
-MAX_LOSS_PER_TRADE = 0.01
+MAX_LOSS_PER_TRADE = 0.0075
 # Isolated-margin liquidation model: the position is liquidated when its loss
 # eats the margin down to the maintenance level (~-0.47 % price move at 100x).
 MAINTENANCE_MARGIN_RATE = 0.005  # 0.5 % of notional
 
 RISK_PER_TRADE = 0.01           # Used only in "risk" mode
 DAILY_DRAWDOWN_LIMIT = 0.03     # 3 % daily equity loss -> circuit breaker
-SUSPENSION_HOURS = 24           # Trading halt duration after a breach
+SUSPENSION_HOURS = 24           # Trading halt duration after a breach ...
+SUSPEND_UNTIL_NEXT_UTC_DAY = True  # ... or (True) only until the next UTC day starts
+# Do not open a trade that could push today's loss past the breaker: today's
+# drawdown + risk of open positions + MAX_LOSS_PER_TRADE must stay <= limit.
+# (On 10-09 a new SOL long was opened at -2.75 % and the breaker closed it
+# 8 seconds later for another -8 $.)
+CHECK_DAILY_RISK_BUDGET = True
 MAX_LEVERAGE = 100.0             # Cap on position notional / equity ("risk" mode)
 MAX_OPEN_POSITIONS = 2          # Max simultaneous positions across all symbols
 # BTC/ETH/SOL/BNB/XRP move together on short timeframes, so 3 longs at once
@@ -112,7 +118,10 @@ MIN_QTY = 0.00001               # Smallest tradable quantity
 #                        the Bollinger Band with extreme RSI snaps back inside;
 #                        only when ADX shows NO trend
 # Compare them on real data first:  python backtest.py --compare-strategies
-STRATEGIES = ["trend_pullback", "squeeze_breakout", "bb_reversion"]
+# squeeze_breakout is OFF by default: 3 of 3 live trades on 10-09 and the
+# synthetic backtest lost. Re-enable only if --compare-strategies on real
+# data shows it is profitable.
+STRATEGIES = ["trend_pullback", "bb_reversion"]
 
 # ---------------------------------------------------------------------------
 # Strategy / indicators
@@ -160,7 +169,8 @@ KC_ATR_MULT = 1.5
 
 # squeeze_breakout
 SQZ_MIN_BARS = 6                # Squeeze must have lasted >= 6 bars ...
-SQZ_LOOKBACK = 3                # ... and released within the last 3 bars
+SQZ_LOOKBACK = 2                # ... and released on this or the previous bar
+                                # (3 bars let it enter late, after the move)
 SQZ_VOLUME_RATIO = 1.2          # Breakout bar volume >= 1.2 x 20-bar average
 SQZ_USE_TREND_FILTER = True     # Only break out in the EMA200 direction
 SQZ_SL_ATR = 1.5                # Stop = 1.5 x ATR
@@ -175,6 +185,15 @@ BBR_MIN_RR = 1.2                # Target is the middle band; skip if reward < 1.
 
 SL_ATR_MULTIPLIER = 1.5         # Stop distance = 1.5 x ATR
 RR_RATIO = 2.0                  # Take-profit distance = RR x stop distance
+
+# Minimum stop distance = this x worst-case round-trip cost (0.16 % -> 0.48 %).
+# Why: with a 0.26 % stop (10-09 log) costs were 0.16 %, so a 2R winner netted
+# 0.36 % while a loser cost 0.42 % - the real RR was 0.85 and the bot needed
+# a 54 % win rate just to break even. With 0.48 %: winner +0.80 %, loser
+# -0.64 %, real RR 1.25, break-even win rate 44 %. Tighter ATR stops are
+# widened to this (and the target moves out to RR x stop); the position size
+# shrinks automatically through MAX_LOSS_PER_TRADE, so the $ risk is the same.
+MIN_STOP_COST_MULTIPLE = 3.0
 
 # Break-even stop: once price has moved BREAKEVEN_TRIGGER_R x the initial
 # stop distance in our favour, the stop is moved to entry + round-trip costs,

@@ -604,6 +604,7 @@ class BotWorker:
                 else:
                     # Freshest price: the WebSocket tick if the stream is live
                     entry_px = self._stream_price(sym) or price
+                    diag = dict(diag, context=strategy.entry_context(closed_df.iloc[-1], diag))
                     self._enter(sym, signal, entry_px, float(closed_df["ATR"].iloc[-1]), diag)
 
     def _enter(self, sym: str, side: str, price: float, atr_value: float,
@@ -629,8 +630,16 @@ class BotWorker:
             logger.info("%s entry skipped: %s", sym, why)
             return
 
+        if getattr(config, "CHECK_DAILY_RISK_BUDGET", False):
+            risk_frac = qty * (abs(price - sl) + price * strategy.round_trip_cost_pct()) \
+                / max(self.engine.day_start_equity, 1e-9)
+            ok, why = self.risk.daily_risk_budget_ok(self.engine, risk_frac)
+            if not ok:
+                logger.info("%s entry skipped: %s", sym, why)
+                return
+
         self.engine.open_position(side, price, qty, sl, tp, symbol=sym, leverage=leverage,
-                                  strategy=diag.get("strategy"))
+                                  strategy=diag.get("strategy"), context=diag.get("context"))
 
     # ------------------------------------------------------------------
     # Entry filters
